@@ -1126,6 +1126,67 @@ def scrape_status(job_id: str):
     return job
 
 
+# ---------------------------------------------------------------------------
+# /post_social  — post video to social platforms via PostForMe
+# ---------------------------------------------------------------------------
+
+POSTFORME_KEY = os.environ.get("POSTFORME_API_KEY", "pfm_live_NKkQ1qHJvcuWFCudHFJvEn")
+POSTFORME_PROJECT = os.environ.get("POSTFORME_PROJECT_ID", "proj_aQKJvY2qoTLqrAxdDgO")
+
+class PostSocialRequest(BaseModel):
+    tiktok_url: str | None = None
+    instagram_url: str | None = None
+    youtube_url: str | None = None
+    facebook_url: str | None = None
+    tiktok_caption: str = ""
+    instagram_caption: str = ""
+    youtube_caption: str = ""
+    facebook_caption: str = ""
+    schedule_at: str | None = None  # ISO8601 — None = post immediately
+
+
+@app.post("/post_social")
+def post_social(req: PostSocialRequest):
+    """Post rendered videos to social platforms via PostForMe API."""
+    import requests as _req
+
+    headers = {
+        "Authorization": f"Bearer {POSTFORME_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    platform_map = {
+        "tiktok":    (req.tiktok_url,    req.tiktok_caption),
+        "instagram": (req.instagram_url, req.instagram_caption),
+        "youtube":   (req.youtube_url,   req.youtube_caption),
+        "facebook":  (req.facebook_url,  req.facebook_caption),
+    }
+
+    results = {}
+    for platform, (video_url, caption) in platform_map.items():
+        if not video_url:
+            continue
+        payload = {
+            "project_id": POSTFORME_PROJECT,
+            "platform": platform,
+            "video_url": video_url,
+            "caption": caption,
+        }
+        if req.schedule_at:
+            payload["scheduled_at"] = req.schedule_at
+        else:
+            payload["publish_now"] = True
+
+        try:
+            r = _req.post("https://api.postfor.me/v1/posts",
+                          json=payload, headers=headers, timeout=30)
+            results[platform] = {"status": r.status_code, "body": r.json()}
+        except Exception as e:
+            results[platform] = {"status": "error", "error": str(e)}
+
+    return {"status": "ok", "results": results}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
