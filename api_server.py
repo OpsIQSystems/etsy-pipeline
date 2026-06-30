@@ -790,6 +790,19 @@ def _burn_ass_captions(raw_path: Path, out_path: Path, ass_content: str) -> bool
         ass_file.unlink(missing_ok=True)
 
 
+def _upload_to_cdn(path: Path) -> str | None:
+    """Upload video to 0x0.st for persistent URL that survives Railway redeployments."""
+    import requests as _req
+    try:
+        with open(path, "rb") as f:
+            r = _req.post("https://0x0.st", files={"file": (path.name, f, "video/mp4")}, timeout=120)
+        if r.status_code == 200:
+            return r.text.strip()
+    except Exception as e:
+        print(f"WARNING: CDN upload failed: {e}")
+    return None
+
+
 def _render_video_sync(req: "RenderVideoRequest"):
     """Actual render logic — runs in background thread."""
     import uuid, requests, tempfile
@@ -992,7 +1005,9 @@ def _render_video_sync(req: "RenderVideoRequest"):
             raw_path.unlink(missing_ok=True)
 
         rendered_canvas[canvas_key] = out_path
-        urls[platform] = f"https://{PUBLIC_BASE}/media/{out_path.name}"
+        # Upload to persistent file host so URL survives Railway redeployments
+        cdn_url = _upload_to_cdn(out_path)
+        urls[platform] = cdn_url or f"https://{PUBLIC_BASE}/media/{out_path.name}"
         captions[platform] = _format_caption(req.script[:500], platform)
 
     # cleanup tmp
