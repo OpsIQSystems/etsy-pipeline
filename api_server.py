@@ -701,43 +701,77 @@ def _get_word_timestamps(text: str, voice: str) -> tuple[bytes, list[dict]]:
 
 def _build_caption_clips(words: list[dict], max_dur: float, spec: dict) -> list:
     """
-    Group words into 3-word caption blocks. Each block pops on screen as a
-    bold centered overlay. Current-speaking words are yellow, rest white.
-    Returns list of moviepy ImageClips.
+    TikTok-style animated captions: 3-word groups, word-by-word yellow highlight.
+    Renders each state as a full-frame RGB image (no alpha compositing issues).
+    Dark pill background behind text ensures visibility on any footage.
     """
     from PIL import Image, ImageDraw, ImageFont
     from moviepy import ImageClip
+    import numpy as np
 
     if not words:
         return []
 
     W, H = spec["w"], spec["h"]
-    FONT_SIZE = max(54, W // 18)
-    PADDING = 20
+    FONT_SIZE = max(80, W // 12)   # big — TikTok style
+    STROKE = 5
+    PAD_X, PAD_Y = 28, 18
+    WORD_GAP = 16
+    GROUP = 3
+
     try:
         pil_font = ImageFont.truetype(FONT, FONT_SIZE)
-        pil_font_small = ImageFont.truetype(FONT, max(36, FONT_SIZE - 14))
     except Exception:
         pil_font = ImageFont.load_default()
-        pil_font_small = pil_font
 
-    def _word_img(text: str, highlight: bool) -> Image.Image:
-        color = (255, 220, 0) if highlight else (255, 255, 255)  # yellow or white
-        stroke = (0, 0, 0)
-        dummy = Image.new("RGBA", (1, 1))
+    def _measure(text):
+        dummy = Image.new("RGB", (1, 1))
         d = ImageDraw.Draw(dummy)
-        bbox = d.textbbox((0, 0), text, font=pil_font, stroke_width=3)
-        tw = bbox[2] - bbox[0] + PADDING * 2
-        th = bbox[3] - bbox[1] + PADDING
-        img = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-        d2 = ImageDraw.Draw(img)
-        d2.text((PADDING, PADDING // 2), text, font=pil_font,
-                fill=color, stroke_width=3, stroke_fill=stroke)
-        return img
+        bb = d.textbbox((0, 0), text, font=pil_font, stroke_width=STROKE)
+        return bb[2] - bb[0], bb[3] - bb[1]
+
+    def _render_group_frame(group_words, highlight_idx):
+        """Render a full W×H frame with the caption group, one word highlighted."""
+        sizes = [_measure(w["word"]) for w in group_words]
+        total_text_w = sum(s[0] for s in sizes) + WORD_GAP * (len(sizes) - 1)
+        text_h = max(s[1] for s in sizes)
+
+        pill_w = total_text_w + PAD_X * 2
+        pill_h = text_h + PAD_Y * 2
+
+        # Full frame, black background (will be used as overlay mask via RGBA)
+        frame = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(frame)
+
+        # Caption zone: 65% down the frame
+        cap_cx = W // 2
+        cap_cy = int(H * 0.65)
+        pill_x0 = cap_cx - pill_w // 2
+        pill_y0 = cap_cy - pill_h // 2
+        pill_x1 = pill_x0 + pill_w
+        pill_y1 = pill_y0 + pill_h
+
+        # Dark semi-transparent background pill
+        draw.rounded_rectangle(
+            [pill_x0, pill_y0, pill_x1, pill_y1],
+            radius=pill_h // 2,
+            fill=(0, 0, 0, 185)
+        )
+
+        # Draw each word
+        x = pill_x0 + PAD_X
+        y = pill_y0 + PAD_Y
+        for wi, w in enumerate(group_words):
+            color = (255, 220, 0) if wi == highlight_idx else (255, 255, 255)
+            draw.text(
+                (x, y), w["word"], font=pil_font,
+                fill=color, stroke_width=STROKE, stroke_fill=(0, 0, 0, 255)
+            )
+            x += sizes[wi][0] + WORD_GAP
+
+        return np.array(frame)
 
     clips = []
-    GROUP = 3  # words per caption block
-
     for gi in range(0, len(words), GROUP):
         group = words[gi: gi + GROUP]
         t_start = group[0]["start"]
@@ -745,48 +779,18 @@ def _build_caption_clips(words: list[dict], max_dur: float, spec: dict) -> list:
         if t_start >= max_dur:
             break
         t_end = min(t_end, max_dur)
-        duration = t_end - t_start
-        if duration < 0.1:
-            continue
 
-        # Build a composite PIL image of the group (words side by side)
-        word_imgs = [_word_img(w["word"], False) for w in group]
-        total_w = sum(img.width for img in word_imgs) + 10 * (len(word_imgs) - 1)
-        max_h   = max(img.height for img in word_imgs)
-
-        # One image per word-within-group highlight state is too many clips.
-        # Instead render group as static block; highlight switches per word.
         for wi, w in enumerate(group):
             w_start = max(w["start"], t_start)
             w_end   = min(w["end"], t_end, max_dur)
-            if w_end <= w_start:
+            if w_end - w_start < 0.05:
                 continue
 
-            # Rebuild group with this word highlighted
-            wimgs = [_word_img(gw["word"], j == wi) for j, gw in enumerate(group)]
-            tw = sum(img.width for img in wimgs) + 10 * (len(wimgs) - 1)
-            th = max(img.height for img in wimgs)
-            canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-            x = 0
-            for wimg in wimgs:
-                canvas.paste(wimg, (x, (th - wimg.height) // 2), wimg)
-                x += wimg.width + 10
-
-            # Scale down if wider than frame
-            if canvas.width > W - 40:
-                scale = (W - 40) / canvas.width
-                canvas = canvas.resize(
-                    (int(canvas.width * scale), int(canvas.height * scale)),
-                    Image.LANCZOS
-                )
-
-            import numpy as np
-            arr = np.array(canvas)
+            arr = _render_group_frame(group, wi)
             clip = (
                 ImageClip(arr, is_mask=False)
                 .with_start(w_start)
                 .with_duration(w_end - w_start)
-                .with_position(("center", 0.72), relative=True)
             )
             clips.append(clip)
 
