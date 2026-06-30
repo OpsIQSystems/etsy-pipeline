@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HVAC Job Bid Calculator — OpsIQ Systems</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  .header {
+    text-align: center;
+    margin-bottom: 24px;
+  }
+  .header h1 {
+    font-size: 22px;
+    color: #00d4ff;
+    letter-spacing: 1px;
+  }
+  .header p {
+    font-size: 13px;
+    color: #888;
+    margin-top: 4px;
+  }
+  .sheet {
+    background: #0f0f1a;
+    border: 1px solid #2a2a4a;
+    border-radius: 12px;
+    overflow: hidden;
+    width: 100%;
+    max-width: 680px;
+    box-shadow: 0 8px 32px rgba(0,212,255,0.1);
+  }
+  .sheet-header {
+    background: #16213e;
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid #2a2a4a;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .dot.red { background: #ff5f57; }
+  .dot.yellow { background: #febc2e; }
+  .dot.green { background: #28c840; }
+  .sheet-title { margin-left: 8px; font-size: 13px; color: #666; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th {
+    background: #16213e;
+    color: #00d4ff;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 8px 14px;
+    text-align: left;
+    border-bottom: 2px solid #00d4ff33;
+  }
+  td {
+    padding: 9px 14px;
+    font-size: 14px;
+    border-bottom: 1px solid #1a1a2e;
+  }
+  tr:nth-child(even) td { background: #0d0d18; }
+  .label { color: #aaa; }
+  .value {
+    color: #fff;
+    font-weight: 600;
+    font-family: 'Courier New', monospace;
+  }
+  .value.typing {
+    border-right: 2px solid #00d4ff;
+    animation: blink 0.7s step-end infinite;
+  }
+  @keyframes blink { 50% { border-color: transparent; } }
+  .value.calculated { color: #00d4ff; }
+  .verdict-row td { padding: 16px 14px; }
+  .verdict {
+    display: inline-block;
+    padding: 10px 28px;
+    border-radius: 8px;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    opacity: 0;
+    transform: scale(0.8);
+    transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  }
+  .verdict.show { opacity: 1; transform: scale(1); }
+  .verdict.BID { background: #00c851; color: #fff; box-shadow: 0 0 20px #00c85155; }
+  .verdict.NEGOTIATE { background: #ff8800; color: #fff; box-shadow: 0 0 20px #ff880055; }
+  .verdict.PASS { background: #cc0000; color: #fff; box-shadow: 0 0 20px #cc000055; }
+  .profit-row td { background: #001a0a !important; }
+  .profit-val { color: #00c851; font-size: 20px; font-weight: 700; font-family: monospace; }
+  .cursor { display: inline-block; width: 2px; height: 1em; background: #00d4ff; vertical-align: middle; animation: blink 0.7s step-end infinite; }
+  .section-divider td {
+    background: #16213e !important;
+    color: #00d4ff;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    padding: 6px 14px;
+  }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>⚡ HVAC Job Bid Calculator</h1>
+  <p>OpsIQ Systems · Know your floor price before you quote</p>
+</div>
+<div class="sheet">
+  <div class="sheet-header">
+    <div class="dot red"></div>
+    <div class="dot yellow"></div>
+    <div class="dot green"></div>
+    <span class="sheet-title">HVAC_Job_Bid_Calculator.xlsx — Google Sheets</span>
+  </div>
+  <table>
+    <tr><th>Field</th><th>Your Input</th><th>Calculated</th></tr>
+
+    <tr class="section-divider"><td colspan="3">JOB DETAILS</td></tr>
+    <tr><td class="label">Job Type</td><td class="value" id="job-type">&nbsp;</td><td></td></tr>
+    <tr><td class="label">Labor Hours</td><td class="value" id="labor-hours">&nbsp;</td><td></td></tr>
+    <tr><td class="label">Technician Rate ($/hr)</td><td class="value" id="tech-rate">&nbsp;</td><td></td></tr>
+    <tr><td class="label">Materials Cost</td><td class="value" id="materials">&nbsp;</td><td></td></tr>
+    <tr><td class="label">Drive Time (hrs)</td><td class="value" id="drive-time">&nbsp;</td><td></td></tr>
+
+    <tr class="section-divider"><td colspan="3">OVERHEAD & MARKUP</td></tr>
+    <tr><td class="label">Overhead Rate</td><td class="value" id="overhead">&nbsp;</td><td></td></tr>
+    <tr><td class="label">Target Margin</td><td class="value" id="margin">&nbsp;</td><td></td></tr>
+
+    <tr class="section-divider"><td colspan="3">RESULTS</td></tr>
+    <tr><td class="label">Total Labor Cost</td><td></td><td class="value calculated" id="total-labor">&nbsp;</td></tr>
+    <tr><td class="label">Total Job Cost</td><td></td><td class="value calculated" id="total-cost">&nbsp;</td></tr>
+    <tr><td class="label">Floor Price (break-even)</td><td></td><td class="value calculated" id="floor-price">&nbsp;</td></tr>
+    <tr><td class="label">Recommended Quote</td><td></td><td class="value calculated" id="rec-quote">&nbsp;</td></tr>
+
+    <tr class="section-divider"><td colspan="3">VERDICT</td></tr>
+    <tr class="verdict-row">
+      <td class="label">Decision</td>
+      <td colspan="2"><span class="verdict BID" id="verdict">✓ BID IT</span></td>
+    </tr>
+    <tr class="profit-row">
+      <td class="label">Projected Profit</td>
+      <td colspan="2"><span class="profit-val" id="profit">&nbsp;</span></td>
+    </tr>
+  </table>
+</div>
+
+<script>
+async function typeInto(id, text, delay = 80) {
+  const el = document.getElementById(id);
+  el.classList.add('typing');
+  for (let i = 0; i <= text.length; i++) {
+    el.textContent = text.slice(0, i);
+    await sleep(delay + Math.random() * 40);
+  }
+  el.classList.remove('typing');
+}
+
+async function calcReveal(id, value, prefix = '') {
+  const el = document.getElementById(id);
+  await sleep(300);
+  el.textContent = prefix + value;
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function run() {
+  await sleep(1200);
+
+  await typeInto('job-type', 'AC Install + Duct Work', 70);
+  await sleep(400);
+  await typeInto('labor-hours', '8', 120);
+  await sleep(300);
+  await typeInto('tech-rate', '$55', 100);
+  await sleep(300);
+  await typeInto('materials', '$1,840', 80);
+  await sleep(300);
+  await typeInto('drive-time', '1.5', 120);
+  await sleep(600);
+
+  await typeInto('overhead', '28%', 100);
+  await sleep(300);
+  await typeInto('margin', '22%', 100);
+  await sleep(800);
+
+  // Reveal calculations with stagger
+  await calcReveal('total-labor', '$522.50', '');
+  await sleep(350);
+  await calcReveal('total-cost', '$2,362.50', '');
+  await sleep(350);
+  await calcReveal('floor-price', '$3,024.00', '');
+  await sleep(350);
+  await calcReveal('rec-quote', '$8,400.00', '');
+  await sleep(700);
+
+  // Verdict pop
+  const verdict = document.getElementById('verdict');
+  verdict.classList.add('show');
+  await sleep(500);
+  document.getElementById('profit').textContent = '+ $2,137.50';
+}
+
+run();
+</script>
+</body>
+</html>
