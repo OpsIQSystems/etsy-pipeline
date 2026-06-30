@@ -924,6 +924,23 @@ def _render_video_sync(req: "RenderVideoRequest"):
             except Exception:
                 pass
 
+        # CTA card — last 3 seconds, points to shop
+        try:
+            from moviepy import TextClip
+            cta_start = max(0, max_dur - 3.0)
+            cta_clip = (
+                TextClip(font=FONT, text="🔗 Link in bio\nsearchopsiq.etsy.com",
+                         font_size=max(34, spec["w"] // 28),
+                         color="#FFE600", stroke_color="black", stroke_width=3,
+                         method="caption", size=(spec["w"] - 60, None))
+                .with_position(("center", 0.80), relative=True)
+                .with_start(cta_start)
+                .with_duration(max_dur - cta_start)
+            )
+            overlays.append(cta_clip)
+        except Exception:
+            pass
+
         # Case study card
         if req.video_type == "ugc_casestudy" and req.case_study_data:
             try:
