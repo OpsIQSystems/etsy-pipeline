@@ -163,22 +163,51 @@ def analyze_opportunities(req: AnalyzeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Platform specs — enforced on every render, no exceptions
+PLATFORM_SPECS = {
+    "tiktok":     {"w": 1080, "h": 1920, "max_sec": 60,  "max_mb": 287, "fps": 30},
+    "instagram":  {"w": 1080, "h": 1920, "max_sec": 90,  "max_mb": 100, "fps": 30},
+    "youtube":    {"w": 1080, "h": 1920, "max_sec": 60,  "max_mb": 256, "fps": 30},
+    "facebook":   {"w": 1280, "h": 720,  "max_sec": 240, "max_mb": 500, "fps": 30},
+    "bluesky":    {"w": 1280, "h": 720,  "max_sec": 60,  "max_mb": 50,  "fps": 30},
+}
+ALL_PLATFORMS = list(PLATFORM_SPECS.keys())
+
+
 class RotationRequest(BaseModel):
     script: str
     voice: str = "en-US-GuyNeural"
     persona_name: str | None = None
     persona_trade: str | None = None
-    product_slug: str | None = None   # if set, uses matching browser demo or stick video
+    product_slug: str | None = None
+    platforms: list[str] = ALL_PLATFORMS  # render for all platforms by default
+
+
+def _fit_video_to_platform(video, spec: dict):
+    """Scale + letterbox/pillarbox source video to exactly the platform canvas."""
+    from moviepy import VideoFileClip, ColorClip, CompositeVideoClip
+    tw, th = spec["w"], spec["h"]
+    vw, vh = video.size
+    scale = min(tw / vw, th / vh)
+    nw, nh = int(vw * scale), int(vh * scale)
+    # ensure even dimensions (required by libx264)
+    nw = nw if nw % 2 == 0 else nw - 1
+    nh = nh if nh % 2 == 0 else nh - 1
+    resized = video.resized((nw, nh))
+    if nw == tw and nh == th:
+        return resized
+    # center on black canvas
+    canvas = ColorClip(size=(tw, th), color=(0, 0, 0)).with_duration(video.duration)
+    x = (tw - nw) // 2
+    y = (th - nh) // 2
+    return CompositeVideoClip([canvas, resized.with_position((x, y))])
 
 
 @app.post("/next_video")
 def next_video(req: RotationRequest):
     """
-    Pick the next video and render it with UGC voiceover.
-    Browser demos play once through (scenario simulations).
-    Stick videos also play once — no looping ever.
-    Audio is trimmed to match video duration so nothing repeats.
-    Pool alternates browser_demo → stick → browser_demo to keep variety.
+    Render one video per requested platform, each formatted to that platform's exact spec.
+    Returns a dict of platform → public URL. No looping. No watermarks.
     """
     import asyncio, uuid, edge_tts
     from moviepy import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip
@@ -190,7 +219,6 @@ def next_video(req: RotationRequest):
     count = int(counter_file.read_text()) if counter_file.exists() else 0
     counter_file.write_text(str(count + 1))
 
-    # alternate demo → stick → demo; fall back to whichever pool exists
     if pool_demos and pool_stick:
         pool = pool_demos if count % 2 == 0 else pool_stick
     elif pool_demos:
@@ -209,49 +237,67 @@ def next_video(req: RotationRequest):
                 break
 
     uid = uuid.uuid4().hex
-    audio_path = BASE / "products" / "audio" / f"{uid}.mp3"
-    out_path   = BASE / "products" / "audio" / f"{uid}_post.mp4"
-    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_dir = BASE / "products" / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = audio_dir / f"{uid}.mp3"
 
     async def _tts():
         await edge_tts.Communicate(req.script, req.voice).save(str(audio_path))
 
     try:
         asyncio.run(_tts())
-        audio = AudioFileClip(str(audio_path))
-        video = VideoFileClip(str(chosen))
+        audio_master = AudioFileClip(str(audio_path))
+        source_video = VideoFileClip(str(chosen))
 
-        # trim to whichever is shorter — video plays once, audio matches it
-        duration = min(video.duration, audio.duration)
-        video = video.subclipped(0, duration)
-        audio = audio.subclipped(0, duration)
-        video = video.with_audio(audio)
+        platforms = [p for p in req.platforms if p in PLATFORM_SPECS]
+        if not platforms:
+            platforms = ALL_PLATFORMS
 
-        if req.persona_name and req.persona_trade:
-            label = f"{req.persona_name}  |  {req.persona_trade}"
-            try:
-                txt = (
-                    TextClip(font=FONT, text=label, font_size=26,
-                             color="white", stroke_color="black", stroke_width=2, method="label")
-                    .with_position(("center", 0.85), relative=True)
-                    .with_duration(duration)
-                )
-                video = CompositeVideoClip([video, txt])
-            except Exception:
-                pass
+        urls = {}
+        for platform in platforms:
+            spec = PLATFORM_SPECS[platform]
+            max_dur = min(source_video.duration, audio_master.duration, spec["max_sec"])
 
-        video.write_videofile(str(out_path), codec="libx264", audio_codec="aac",
-                              logger=None, threads=2)
+            vid = source_video.subclipped(0, max_dur)
+            aud = audio_master.subclipped(0, max_dur)
+
+            # fit to platform canvas (letterbox/pillarbox, no crop, no stretch)
+            vid = _fit_video_to_platform(vid, spec)
+            vid = vid.with_audio(aud)
+
+            # persona overlay
+            if req.persona_name and req.persona_trade:
+                label = f"{req.persona_name}  |  {req.persona_trade}"
+                try:
+                    font_size = 32 if spec["h"] >= 1080 else 24
+                    txt = (
+                        TextClip(font=FONT, text=label, font_size=font_size,
+                                 color="white", stroke_color="black", stroke_width=2, method="label")
+                        .with_position(("center", 0.88), relative=True)
+                        .with_duration(max_dur)
+                    )
+                    vid = CompositeVideoClip([vid, txt])
+                except Exception:
+                    pass
+
+            out_path = audio_dir / f"{uid}_{platform}.mp4"
+            vid.write_videofile(str(out_path), codec="libx264", audio_codec="aac",
+                                fps=spec["fps"], logger=None, threads=2)
+            urls[platform] = f"https://{PUBLIC_BASE}/media/{out_path.name}"
+
         audio_path.unlink(missing_ok=True)
-        filename = out_path.name
-        public_url = f"https://{PUBLIC_BASE}/media/{filename}"
         return {
             "status": "ok",
-            "video_path": str(out_path),
-            "video_url": public_url,
             "source_video": chosen.name,
             "video_type": "browser_demo" if chosen in pool_demos else "stick",
             "rotation_count": count,
+            "urls": urls,
+            # convenience aliases for N8N nodes
+            "tiktok_url":    urls.get("tiktok", ""),
+            "instagram_url": urls.get("instagram", ""),
+            "youtube_url":   urls.get("youtube", ""),
+            "facebook_url":  urls.get("facebook", ""),
+            "bluesky_url":   urls.get("bluesky", ""),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
