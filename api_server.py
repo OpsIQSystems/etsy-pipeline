@@ -1631,7 +1631,18 @@ Rules:
 - Never guarantee results ("you'll make X", "this will save you Y hours").
 - If the comment is spam, hate, or completely off-topic, reply with the single word: SKIP
 - Do not use hashtags. Do not use emojis unless the comment itself has them.
-- Write as the brand voice, not as a bot."""
+- Write as the brand voice, not as a bot.
+
+Return ONLY a raw JSON object with these exact keys — no markdown, no extra text:
+{
+  "reply": "<your reply, or null to skip>",
+  "idea": "<one-sentence product/feature idea from the comment, or null>",
+  "complaint": <true or false>,
+  "complaint_summary": "<brief complaint description, or null>"
+}
+
+Idea rule: only extract if the comment genuinely suggests a tool, feature, or use-case. Phrase as "A tool for X that does Y."
+Complaint rule: set true if the comment expresses dissatisfaction, frustration, a broken product, or a refund request. Still write a warm reply."""
 
 
 def _yt_has_owner_reply(thread: dict, channel_id: str) -> bool:
@@ -1643,20 +1654,44 @@ def _yt_has_owner_reply(thread: dict, channel_id: str) -> bool:
     return False
 
 
-def _claude_reply(comment_text: str) -> str | None:
-    """Generate a reply via Claude. Returns None if the comment should be skipped."""
-    import anthropic
+def _claude_reply(comment_text: str) -> dict:
+    """Analyze a comment via Claude. Returns dict: reply, idea, complaint, complaint_summary."""
+    import anthropic, json as _json
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=120,
+        max_tokens=300,
         system=ENGAGE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": comment_text}],
     )
-    text = msg.content[0].text.strip()
-    if text.upper() == "SKIP" or not text:
-        return None
-    return text
+    raw = msg.content[0].text.strip()
+    try:
+        data = _json.loads(raw)
+    except Exception:
+        data = {"reply": raw if raw.upper() != "SKIP" else None, "idea": None, "complaint": False, "complaint_summary": None}
+    return data
+
+
+def _log_idea(platform: str, author: str, comment: str, idea: str) -> None:
+    import datetime as _dt
+    f = BASE / "products" / "ideas.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    if not f.exists():
+        f.write_text("# Product Ideas from Comments\n\n")
+    today = _dt.date.today().isoformat()
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(f"## {today} — {platform} (@{author})\n**Comment:** {comment[:200]}\n**Idea:** {idea}\n\n")
+
+
+def _log_complaint(platform: str, author: str, comment: str, summary: str) -> None:
+    import datetime as _dt
+    f = BASE / "products" / "complaints.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    if not f.exists():
+        f.write_text("# Flagged Complaints\n\n")
+    today = _dt.date.today().isoformat()
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(f"## {today} — {platform} (@{author})\n**Comment:** {comment[:200]}\n**Issue:** {summary}\n**Status:** open\n\n")
 
 
 @app.post("/add_facebook_card")
@@ -1777,12 +1812,18 @@ def engage_comments(req: EngageCommentsRequest):
                 author = thread["snippet"]["topLevelComment"]["snippet"]["authorDisplayName"]
 
                 try:
-                    reply_text = _claude_reply(comment_text)
+                    cl = _claude_reply(comment_text)
                 except Exception as e:
                     results["errors"].append(f"Claude error on thread {thread_id}: {e}")
                     continue
 
-                if reply_text is None:
+                if cl.get("idea"):
+                    _log_idea("youtube", author, comment_text, cl["idea"])
+                if cl.get("complaint"):
+                    _log_complaint("youtube", author, comment_text, cl.get("complaint_summary") or "")
+
+                reply_text = cl.get("reply")
+                if not reply_text:
                     results["youtube"].append({"thread_id": thread_id, "author": author, "action": "skipped"})
                     _replied_yt_ids.add(thread_id)
                     continue
@@ -1802,6 +1843,8 @@ def engage_comments(req: EngageCommentsRequest):
                         "author": author,
                         "comment": comment_text[:80],
                         "reply": reply_text,
+                        "idea": cl.get("idea"),
+                        "complaint": cl.get("complaint", False),
                         "action": "replied",
                     })
                 else:
@@ -1846,12 +1889,18 @@ def engage_comments(req: EngageCommentsRequest):
             comment_text = c.get("message", "")
             author = c.get("from", {}).get("name", "")
             try:
-                reply_text = _claude_reply(comment_text)
+                cl = _claude_reply(comment_text)
             except Exception as e:
                 results["errors"].append(f"Claude error on FB comment {cid}: {e}")
                 continue
 
-            if reply_text is None:
+            if cl.get("idea"):
+                _log_idea("facebook", author, comment_text, cl["idea"])
+            if cl.get("complaint"):
+                _log_complaint("facebook", author, comment_text, cl.get("complaint_summary") or "")
+
+            reply_text = cl.get("reply")
+            if not reply_text:
                 results["facebook"].append({"comment_id": cid, "author": author, "action": "skipped"})
                 continue
 
@@ -1867,6 +1916,8 @@ def engage_comments(req: EngageCommentsRequest):
                     "author": author,
                     "comment": comment_text[:80],
                     "reply": reply_text,
+                    "idea": cl.get("idea"),
+                    "complaint": cl.get("complaint", False),
                     "action": "replied",
                 })
             else:
