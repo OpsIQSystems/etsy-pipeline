@@ -1200,6 +1200,30 @@ def post_social(req: PostSocialRequest):
     return {"status": "ok", "results": results}
 
 
+@app.get("/pfm_accounts")
+def pfm_accounts():
+    """Proxy: list PostForMe social accounts to discover sa_ IDs."""
+    import requests as _req
+    headers = {"Authorization": f"Bearer {POSTFORME_KEY}", "Content-Type": "application/json"}
+    results = {}
+    for path in [
+        f"/social-accounts?project_id={POSTFORME_PROJECT}",
+        f"/social-accounts",
+        f"/accounts?project_id={POSTFORME_PROJECT}",
+        f"/connections?project_id={POSTFORME_PROJECT}",
+    ]:
+        try:
+            r = _req.get(f"https://api.postforme.dev{path}", headers=headers, timeout=15)
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text[:500]
+            results[path] = {"status": r.status_code, "body": body}
+        except Exception as e:
+            results[path] = {"error": str(e)}
+    return results
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
