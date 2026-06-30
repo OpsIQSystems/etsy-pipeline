@@ -1132,7 +1132,7 @@ def scrape_status(job_id: str):
 
 POSTFORME_KEY     = os.environ.get("POSTFORME_API_KEY",    "pfm_live_NKkQ1qHJvcuWFCudHFJvEn")
 POSTFORME_PROJECT = os.environ.get("POSTFORME_PROJECT_ID", "proj_aQKJvY2qoTLqrAxdDgO")
-POSTFORME_URL     = "https://api.postforme.dev/social-posts"
+POSTFORME_URL     = "https://api.postforme.dev/v1/social-posts"
 
 # Social account IDs from PostForMe dashboard (spc_ = social provider connection)
 POSTFORME_ACCOUNTS = {
