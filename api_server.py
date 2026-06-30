@@ -1602,6 +1602,48 @@ def _claude_reply(comment_text: str) -> str | None:
     return text
 
 
+@app.post("/add_facebook_card")
+def add_facebook_card(req: AddYouTubeCardRequest):
+    """
+    Post the Etsy link as a comment on the latest Facebook post.
+    Skips humor videos. Mirrors /add_youtube_card behaviour.
+    """
+    if req.video_type == "humor":
+        return {"status": "skipped", "reason": "humor video — no CTA comment needed"}
+
+    import requests as _req, time
+    time.sleep(90)
+
+    token = FB_PAGE_TOKEN
+    page  = FB_PAGE_ID
+    if not token or not page:
+        raise HTTPException(status_code=428, detail="FB_PAGE_TOKEN / FB_PAGE_ID env vars not set")
+
+    # Get latest post
+    feed = _req.get(
+        f"https://graph.facebook.com/v19.0/{page}/posts",
+        params={"access_token": token, "limit": 1, "fields": "id"},
+        timeout=15,
+    ).json()
+    items = feed.get("data", [])
+    if not items:
+        raise HTTPException(status_code=404, detail="No Facebook posts found on page")
+    post_id = items[0]["id"]
+
+    body = f"🔗 Get it here → {req.etsy_url}" + (f"\n({req.product_name})" if req.product_name else "")
+
+    r = _req.post(
+        f"https://graph.facebook.com/v19.0/{post_id}/comments",
+        params={"access_token": token},
+        json={"message": body},
+        timeout=20,
+    )
+    if not r.ok:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+
+    return {"status": "ok", "post_id": post_id, "comment_id": r.json().get("id"), "comment": body}
+
+
 class EngageCommentsRequest(BaseModel):
     video_id: str | None = None   # auto-detects latest if omitted
     max_comments: int = 20        # how many top-level threads to scan
