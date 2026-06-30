@@ -176,18 +176,56 @@ class PostForMePoster:
                          timeout=600).raise_for_status()
         return media_url
 
-    def post(self, video_path, caption, title=None, tags=None):
+    def post(self, video_path, caption, title=None, tags=None,
+             platform_videos: dict = None, platform_captions: dict = None):
+        """Post per-platform if platform_videos dict provided, else single post to all accounts.
+
+        platform_videos:  {"tiktok": "/path/tiktok.mp4", "instagram": "/path/instagram.mp4", ...}
+        platform_captions: {"tiktok": "caption...", "instagram": "caption...", ...}
+        """
         import requests
-        accounts = self._resolve_accounts()
-        media_url = self._upload_media(video_path)
-        r = requests.post(f"{self.BASE}/social-posts", headers=self._headers(),
-                          json={"caption": caption, "social_accounts": accounts,
-                                "media": [{"url": media_url}]}, timeout=180)
-        if r.status_code >= 400:
-            raise RuntimeError(f"post failed {r.status_code}: {r.text}")
-        out = r.json()
-        print(f"    [PostForMe] created post id={out.get('id')} -> {len(accounts)} account(s)")
-        return {"status": "created", "id": out.get("id")}
+
+        # Map platform name → PostForMe account id
+        ACCOUNT_IDS = {
+            "youtube":   "UC04oCwObnayhYjHMyUMzFwg",
+            "instagram": "17841425222986458",
+            "tiktok":    "-000nHuLr7f6aG2up5DjIH5DOQfkUiNsR9F6",
+            "bluesky":   "did:plc:ncv74laxg4yeywzwkzhtynnv",
+        }
+
+        if platform_videos:
+            results = []
+            for platform, vid_path in platform_videos.items():
+                acct_id = ACCOUNT_IDS.get(platform)
+                if not acct_id:
+                    print(f"    [PostForMe] skipping {platform} — no account id")
+                    continue
+                pcaption = (platform_captions or {}).get(platform, caption)
+                media_url = self._upload_media(vid_path)
+                r = requests.post(f"{self.BASE}/social-posts", headers=self._headers(),
+                                  json={"caption": pcaption,
+                                        "social_accounts": [acct_id],
+                                        "media": [{"url": media_url}]}, timeout=180)
+                if r.status_code >= 400:
+                    print(f"    [PostForMe] {platform} failed {r.status_code}: {r.text}")
+                    results.append({"platform": platform, "status": "error", "error": r.text})
+                else:
+                    out = r.json()
+                    print(f"    [PostForMe] {platform} post id={out.get('id')}")
+                    results.append({"platform": platform, "status": "created", "id": out.get("id")})
+            return {"status": "created", "results": results}
+        else:
+            # fallback: single video to all accounts
+            accounts = self._resolve_accounts()
+            media_url = self._upload_media(video_path)
+            r = requests.post(f"{self.BASE}/social-posts", headers=self._headers(),
+                              json={"caption": caption, "social_accounts": accounts,
+                                    "media": [{"url": media_url}]}, timeout=180)
+            if r.status_code >= 400:
+                raise RuntimeError(f"post failed {r.status_code}: {r.text}")
+            out = r.json()
+            print(f"    [PostForMe] created post id={out.get('id')} -> {len(accounts)} account(s)")
+            return {"status": "created", "id": out.get("id")}
 
 
 _BACKENDS = {"youtube": YouTubePoster, "postforme": PostForMePoster, "dry": DryRunPoster}
