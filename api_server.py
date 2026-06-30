@@ -165,13 +165,41 @@ def analyze_opportunities(req: AnalyzeRequest):
 
 # Platform specs — enforced on every render, no exceptions
 PLATFORM_SPECS = {
-    "tiktok":     {"w": 1080, "h": 1920, "max_sec": 60,  "max_mb": 287, "fps": 30},
-    "instagram":  {"w": 1080, "h": 1920, "max_sec": 90,  "max_mb": 100, "fps": 30},
-    "youtube":    {"w": 1080, "h": 1920, "max_sec": 60,  "max_mb": 256, "fps": 30},
-    "facebook":   {"w": 1280, "h": 720,  "max_sec": 240, "max_mb": 500, "fps": 30},
-    "bluesky":    {"w": 1280, "h": 720,  "max_sec": 60,  "max_mb": 50,  "fps": 30},
+    "tiktok":     {"w": 1080, "h": 1920, "max_sec": 60,  "max_mb": 287, "fps": 30,
+                   "caption_limit": 2200, "hashtag_limit": 100, "disclosure": "#ad "},
+    "instagram":  {"w": 1080, "h": 1920, "max_sec": 90,  "max_mb": 100, "fps": 30,
+                   "caption_limit": 2200, "hashtag_limit": 30,  "disclosure": "#ad "},
+    "youtube":    {"w": 1080, "h": 1920, "max_sec": 60,  "max_mb": 256, "fps": 30,
+                   "caption_limit": 100,  "hashtag_limit": 3,   "disclosure": ""},
+    "facebook":   {"w": 1280, "h": 720,  "max_sec": 240, "max_mb": 500, "fps": 30,
+                   "caption_limit": 63206,"hashtag_limit": 30,  "disclosure": ""},
+    "bluesky":    {"w": 1280, "h": 720,  "max_sec": 60,  "max_mb": 50,  "fps": 30,
+                   "caption_limit": 300,  "hashtag_limit": 0,   "disclosure": ""},
 }
 ALL_PLATFORMS = list(PLATFORM_SPECS.keys())
+
+
+def _format_caption(raw: str, platform: str, etsy_url: str = "searchopsiq.etsy.com") -> str:
+    """Truncate caption and append CTA within each platform's character limit."""
+    spec = PLATFORM_SPECS.get(platform, {})
+    limit = spec.get("caption_limit", 2200)
+    disclosure = spec.get("disclosure", "")
+    suffix = f" {etsy_url}"
+    max_body = limit - len(disclosure) - len(suffix)
+    body = raw[:max_body] if len(raw) > max_body else raw
+    return f"{disclosure}{body}{suffix}"
+
+
+def _validate_script_json(raw_text: str) -> dict:
+    """Parse Claude's JSON response safely, strip markdown fences if present."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Claude returned invalid JSON: {e} — raw: {text[:200]}")
 
 
 class RotationRequest(BaseModel):
@@ -286,18 +314,26 @@ def next_video(req: RotationRequest):
             urls[platform] = f"https://{PUBLIC_BASE}/media/{out_path.name}"
 
         audio_path.unlink(missing_ok=True)
+        raw_caption = req.script[:500]
         return {
             "status": "ok",
             "source_video": chosen.name,
             "video_type": "browser_demo" if chosen in pool_demos else "stick",
             "rotation_count": count,
             "urls": urls,
-            # convenience aliases for N8N nodes
+            # per-platform video URLs
             "tiktok_url":    urls.get("tiktok", ""),
             "instagram_url": urls.get("instagram", ""),
             "youtube_url":   urls.get("youtube", ""),
             "facebook_url":  urls.get("facebook", ""),
             "bluesky_url":   urls.get("bluesky", ""),
+            # per-platform captions — correctly truncated and formatted
+            "captions": {p: _format_caption(raw_caption, p) for p in platforms},
+            "tiktok_caption":    _format_caption(raw_caption, "tiktok"),
+            "instagram_caption": _format_caption(raw_caption, "instagram"),
+            "youtube_caption":   _format_caption(raw_caption, "youtube"),
+            "facebook_caption":  _format_caption(raw_caption, "facebook"),
+            "bluesky_caption":   _format_caption(raw_caption, "bluesky"),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
