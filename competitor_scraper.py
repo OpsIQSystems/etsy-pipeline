@@ -19,26 +19,72 @@ import requests
 
 CAPSOLVER_KEY = os.environ.get("CAPSOLVER_API_KEY", "")
 
-# ---------------------------------------------------------------------------
-# Reddit — public JSON API, zero cost, zero CAPTCHA
-# ---------------------------------------------------------------------------
+# Reddit OAuth2 credentials — set these in Railway env vars
+# Create a free "script" app at https://www.reddit.com/prefs/apps
+REDDIT_CLIENT_ID     = os.environ.get("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
+REDDIT_USERNAME      = os.environ.get("REDDIT_USERNAME", "")
+REDDIT_PASSWORD      = os.environ.get("REDDIT_PASSWORD", "")
+# Unique User-Agent required by Reddit API TOS
+_REDDIT_UA = "EtsyPipeline/1.0 by u/OpsIQSystems"
 
-_REDDIT_UA = "Mozilla/5.0 (compatible; EtsyPipeline/1.0)"
+# ---------------------------------------------------------------------------
+# Reddit — OAuth2 API (free, 100 req/min, no CAPTCHA)
+# ---------------------------------------------------------------------------
 
 TRADE_SUBREDDITS = [
     "HVAC", "plumbing", "electricians", "Roofing", "Construction",
     "Contractor", "smallbusiness", "Entrepreneur",
 ]
 
+_reddit_token: dict = {}  # cache: {"access_token": "...", "expires_at": timestamp}
+
+
+def _get_reddit_token() -> str:
+    """Get or refresh Reddit OAuth2 access token."""
+    import time as _time
+    now = _time.time()
+    if _reddit_token.get("access_token") and now < _reddit_token.get("expires_at", 0) - 60:
+        return _reddit_token["access_token"]
+
+    if not REDDIT_CLIENT_ID:
+        return ""
+
+    auth = requests.auth.HTTPBasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
+    data = {"grant_type": "password", "username": REDDIT_USERNAME, "password": REDDIT_PASSWORD}
+    r = requests.post(
+        "https://www.reddit.com/api/v1/access_token",
+        auth=auth, data=data,
+        headers={"User-Agent": _REDDIT_UA},
+        timeout=15,
+    )
+    if r.status_code == 200:
+        tok = r.json()
+        _reddit_token["access_token"] = tok["access_token"]
+        _reddit_token["expires_at"] = now + tok.get("expires_in", 3600)
+        return tok["access_token"]
+    print(f"[reddit] token error: {r.status_code} {r.text[:200]}")
+    return ""
+
 
 def scrape_reddit(subreddits: list[str] | None = None, limit: int = 25, sort: str = "hot") -> list[dict]:
-    """Fetch top posts from trade subreddits via Reddit JSON API."""
+    """Fetch top posts from trade subreddits via Reddit OAuth2 API."""
     subs = subreddits or TRADE_SUBREDDITS
     results = []
+
+    token = _get_reddit_token()
+    if token:
+        base_url = "https://oauth.reddit.com"
+        headers = {"Authorization": f"bearer {token}", "User-Agent": _REDDIT_UA}
+    else:
+        # Fallback: try old.reddit.com (sometimes works without auth)
+        base_url = "https://old.reddit.com"
+        headers = {"User-Agent": _REDDIT_UA}
+
     for sub in subs:
-        url = f"https://www.reddit.com/r/{sub}/{sort}.json?limit={limit}"
+        url = f"{base_url}/r/{sub}/{sort}.json?limit={limit}&raw_json=1"
         try:
-            r = requests.get(url, headers={"User-Agent": _REDDIT_UA}, timeout=15)
+            r = requests.get(url, headers=headers, timeout=15)
             if r.status_code == 200:
                 for p in r.json().get("data", {}).get("children", []):
                     d = p.get("data", {})
@@ -54,7 +100,9 @@ def scrape_reddit(subreddits: list[str] | None = None, limit: int = 25, sort: st
                         "url": f"https://reddit.com{d.get('permalink', '')}",
                         "created_utc": d.get("created_utc", 0),
                     })
-            time.sleep(random.uniform(0.5, 1.2))
+            else:
+                print(f"[reddit] r/{sub}: HTTP {r.status_code}")
+            time.sleep(random.uniform(0.3, 0.8))
         except Exception as e:
             print(f"[reddit] r/{sub}: {e}")
     return results
