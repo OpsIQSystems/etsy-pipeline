@@ -977,6 +977,57 @@ def _render_video_sync(req: "RenderVideoRequest"):
 
 
 # ---------------------------------------------------------------------------
+# /scrape_reddit_sync  — sync Reddit scrape, returns immediately (<5s)
+# /scrape_tiktok  — async TikTok scrape via Playwright, poll job_id
+# /scrape  — combined async scrape (competitor shops + both platforms)
+# ---------------------------------------------------------------------------
+
+class RedditScrapeRequest(BaseModel):
+    subreddits: list[str] = ["HVAC", "Contractor", "plumbing", "electricians",
+                              "Roofing", "smallbusiness", "mildlyinfuriating"]
+    limit: int = 25
+    sort: str = "hot"
+
+
+@app.post("/scrape_reddit")
+def scrape_reddit_sync(req: RedditScrapeRequest):
+    """Scrape Reddit via public JSON API. Synchronous — returns data immediately."""
+    import sys
+    sys.path.insert(0, str(BASE))
+    from competitor_scraper import scrape_reddit
+    posts = scrape_reddit(subreddits=req.subreddits, limit=req.limit, sort=req.sort)
+    return {"status": "ok", "count": len(posts), "posts": posts}
+
+
+class TikTokScrapeRequest(BaseModel):
+    hashtags: list[str] = ["hvaclife", "plumberlife", "electricianlife",
+                            "constructionlife", "contractorlife", "tradeslife"]
+    limit: int = 20
+
+
+@app.post("/scrape_tiktok")
+def scrape_tiktok_start(req: TikTokScrapeRequest):
+    """Start async TikTok scrape via Playwright. Poll GET /scrape/{job_id}."""
+    import uuid, threading
+    job_id = uuid.uuid4().hex
+    _scrape_jobs[job_id] = {"status": "pending"}
+
+    def _run():
+        try:
+            import sys
+            sys.path.insert(0, str(BASE))
+            from competitor_scraper import scrape_tiktok
+            videos = scrape_tiktok(hashtags=req.hashtags, limit=req.limit)
+            _scrape_jobs[job_id] = {"status": "done", "result": {"videos": videos, "count": len(videos)}}
+        except Exception as e:
+            _scrape_jobs[job_id] = {"status": "error", "error": str(e)}
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "pending", "job_id": job_id,
+            "poll_url": f"https://{PUBLIC_BASE}/scrape/{job_id}"}
+
+
+# ---------------------------------------------------------------------------
 # /scrape  — competitor + trend scraping (replaces Apify actors)
 # ---------------------------------------------------------------------------
 
