@@ -308,11 +308,10 @@ def scrape_tiktok(hashtags: list[str] | None = None, limit: int = 20) -> list[di
 
 def scrape_etsy_competitor(shop_url: str, max_listings: int = 20, max_reviews: int = 30) -> dict:
     """
-    Scrape a competitor Etsy shop: their listings and recent reviews.
-    shop_url: https://www.etsy.com/shop/ShopName
+    Scrape a competitor Etsy shop: listings + reviews.
+    Uses Playwright page.evaluate() to query the live React-rendered DOM.
     """
     from playwright.sync_api import sync_playwright
-    from bs4 import BeautifulSoup
 
     shop_name = shop_url.rstrip("/").split("/shop/")[-1].split("/")[0]
     result = {"shop": shop_name, "listings": [], "reviews": [], "stats": {}}
@@ -322,63 +321,99 @@ def scrape_etsy_competitor(shop_url: str, max_listings: int = 20, max_reviews: i
         page = ctx.new_page()
         page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
 
-        # Listings
+        # --- Listings ---
         try:
-            page.goto(f"https://www.etsy.com/shop/{shop_name}", timeout=30000)
+            page.goto(f"https://www.etsy.com/shop/{shop_name}", timeout=35000)
             _solve_cloudflare(page)
-            page.wait_for_timeout(random.randint(2000, 3500))
-            soup = BeautifulSoup(page.content(), "html.parser")
+            # Wait for listing cards to render
+            try:
+                page.wait_for_selector("[data-listing-id], .v2-listing-card", timeout=10000)
+            except Exception:
+                page.wait_for_timeout(4000)
 
-            # Sales count from page header
-            for el in soup.select(".wt-text-body-02, .shop-home-header-stats"):
-                txt = el.get_text(strip=True)
-                if "sale" in txt.lower():
-                    result["stats"]["sales_text"] = txt[:100]
-                    break
+            data = page.evaluate(f"""
+                () => {{
+                    const out = {{ stats: {{}}, listings: [] }};
 
-            # Listing cards
-            for card in soup.select("li[data-listing-id], li.wt-list-unstyled")[:max_listings]:
-                title_el = card.select_one("h3, .v2-listing-card__title, [data-listing-id] h3")
-                price_el = card.select_one(".currency-value, .wt-text-title-01")
-                link_el = card.select_one("a[href*='/listing/']")
-                reviews_el = card.select_one(".wt-text-caption, [title*='star']")
-                if title_el:
-                    result["listings"].append({
-                        "title": title_el.get_text(strip=True),
-                        "price": price_el.get_text(strip=True) if price_el else "",
-                        "url": link_el["href"].split("?")[0] if link_el else "",
-                        "rating_snippet": reviews_el.get_text(strip=True) if reviews_el else "",
-                    })
+                    // Sales / rating stats from header
+                    document.querySelectorAll('span, p, div').forEach(el => {{
+                        const t = el.innerText || '';
+                        if (/\\d[,\\d]* sales/i.test(t) && t.length < 60)
+                            out.stats.sales_text = t.trim();
+                    }});
+
+                    // Listing cards
+                    const cards = document.querySelectorAll('[data-listing-id]');
+                    cards.forEach(card => {{
+                        if (out.listings.length >= {max_listings}) return;
+                        const title = card.querySelector('h3, [class*="title"]')?.innerText?.trim() || '';
+                        const price = card.querySelector('[class*="currency"], [class*="price"]')?.innerText?.trim() || '';
+                        const link  = card.querySelector('a[href*="/listing/"]')?.href || '';
+                        const rating = card.querySelector('[aria-label*="star"], [title*="star"]')
+                                          ?.getAttribute('aria-label') || '';
+                        if (title) out.listings.push({{ title, price, url: link.split('?')[0], rating }});
+                    }});
+                    return out;
+                }}
+            """)
+            result["stats"]    = data.get("stats", {})
+            result["listings"] = data.get("listings", [])
+            print(f"[etsy] {shop_name} listings: {len(result['listings'])}")
         except Exception as e:
-            print(f"[etsy] listings for {shop_name}: {e}")
+            print(f"[etsy] listings {shop_name}: {e}")
 
-        # Reviews
+        # --- Reviews ---
         try:
-            page.goto(f"https://www.etsy.com/shop/{shop_name}/reviews", timeout=30000)
+            page.goto(f"https://www.etsy.com/shop/{shop_name}/reviews", timeout=35000)
             _solve_cloudflare(page)
-            page.wait_for_timeout(random.randint(2000, 3500))
-            soup = BeautifulSoup(page.content(), "html.parser")
+            try:
+                page.wait_for_selector("[data-review-region], [class*='review']", timeout=10000)
+            except Exception:
+                page.wait_for_timeout(4000)
 
-            for review in soup.select(".wt-grid__item-xs-12 .wt-display-flex-xs, [data-review-region]")[:max_reviews]:
-                stars_el = review.select_one("[aria-label*='star'], .wt-star-rating, [class*='star']")
-                body_el = review.select_one(
-                    "p.wt-text-body-01, .wt-content-toggle__body, [data-review-text]"
-                )
-                item_el = review.select_one("a[href*='/listing/']")
-                text = body_el.get_text(strip=True) if body_el else ""
-                if text:
-                    result["reviews"].append({
-                        "stars": (stars_el.get("aria-label", "") or "").split(" ")[0] if stars_el else "",
-                        "text": text[:400],
-                        "item": item_el.get_text(strip=True) if item_el else "",
-                        "item_url": item_el["href"].split("?")[0] if item_el else "",
-                    })
+            reviews = page.evaluate(f"""
+                () => {{
+                    const out = [];
+                    // Try multiple selectors Etsy uses for reviews
+                    const containers = document.querySelectorAll(
+                        '[data-review-region], [class*="ReviewsList"] > *, .review-cart'
+                    );
+                    containers.forEach(el => {{
+                        if (out.length >= {max_reviews}) return;
+                        // Review body text
+                        const body = el.querySelector(
+                            'p[class*="body"], [class*="review-text"], p'
+                        )?.innerText?.trim() || '';
+                        // Stars from aria-label
+                        const starEl = el.querySelector('[aria-label*="out of"], [aria-label*="star"]');
+                        const stars = starEl?.getAttribute('aria-label')?.match(/\\d/)?.[0] || '';
+                        // Linked product
+                        const itemEl = el.querySelector('a[href*="/listing/"]');
+                        const item = itemEl?.innerText?.trim() || '';
+                        const itemUrl = itemEl?.href?.split('?')[0] || '';
+                        if (body.length > 10)
+                            out.push({{ stars, text: body.slice(0, 400), item, item_url: itemUrl }});
+                    }});
+
+                    // Fallback: grab all <p> tags that look like review text
+                    if (out.length === 0) {{
+                        document.querySelectorAll('p').forEach(p => {{
+                            if (out.length >= {max_reviews}) return;
+                            const t = p.innerText?.trim() || '';
+                            if (t.length > 30 && t.length < 600 && !t.includes('{{'))
+                                out.push({{ stars: '', text: t.slice(0, 400), item: '', item_url: '' }});
+                        }});
+                    }}
+                    return out;
+                }}
+            """)
+            result["reviews"] = reviews or []
+            print(f"[etsy] {shop_name} reviews: {len(result['reviews'])}")
         except Exception as e:
-            print(f"[etsy] reviews for {shop_name}: {e}")
+            print(f"[etsy] reviews {shop_name}: {e}")
 
         browser.close()
 
-    print(f"[etsy] {shop_name}: {len(result['listings'])} listings, {len(result['reviews'])} reviews")
     return result
 
 
