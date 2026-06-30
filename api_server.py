@@ -699,102 +699,94 @@ def _get_word_timestamps(text: str, voice: str) -> tuple[bytes, list[dict]]:
     return b"".join(audio_chunks), words
 
 
-def _build_caption_clips(words: list[dict], max_dur: float, spec: dict) -> list:
+def _build_ass_subtitles(words: list[dict], max_dur: float, spec: dict) -> str:
     """
-    TikTok-style animated captions: 3-word groups, word-by-word yellow highlight.
-    Renders each state as a full-frame RGB image (no alpha compositing issues).
-    Dark pill background behind text ensures visibility on any footage.
+    Generate ASS subtitle file content: 3-word groups, word-by-word yellow highlight.
+    Burned into video via FFmpeg 'ass' filter — zero MoviePy compositing issues.
+    Colors: highlighted word = yellow (#FFDC00), others = white. Dark box background.
     """
-    from PIL import Image, ImageDraw, ImageFont
-    from moviepy import ImageClip
-    import numpy as np
-
     if not words:
-        return []
+        return ""
 
     W, H = spec["w"], spec["h"]
-    FONT_SIZE = max(80, W // 12)   # big — TikTok style
-    STROKE = 5
-    PAD_X, PAD_Y = 28, 18
-    WORD_GAP = 16
+    FONT_SIZE = max(72, W // 14)
     GROUP = 3
 
-    try:
-        pil_font = ImageFont.truetype(FONT, FONT_SIZE)
-    except Exception:
-        pil_font = ImageFont.load_default()
+    # 65% from top = 35% from bottom — ASS MarginV is distance from bottom edge
+    margin_v = int(H * 0.35)
 
-    def _measure(text):
-        dummy = Image.new("RGB", (1, 1))
-        d = ImageDraw.Draw(dummy)
-        bb = d.textbbox((0, 0), text, font=pil_font, stroke_width=STROKE)
-        return bb[2] - bb[0], bb[3] - bb[1]
+    # ASS color format: &HAABBGGRR (alpha, blue, green, red)
+    # Yellow #FFDC00 → R=FF G=DC B=00 → &H0000DCFF
+    # White  #FFFFFF → &H00FFFFFF
+    # Box background: black, ~70% opaque (alpha 0x46 in ASS = 100% - 70%)
+    header = (
+        f"[Script Info]\n"
+        f"ScriptType: v4.00+\n"
+        f"PlayResX: {W}\n"
+        f"PlayResY: {H}\n"
+        f"WrapStyle: 0\n"
+        f"ScaledBorderAndShadow: yes\n\n"
+        f"[V4+ Styles]\n"
+        f"Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        f"Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        f"Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Caption,Liberation Sans,{FONT_SIZE},&H00FFFFFF,&H0000DCFF,&H00000000,&H46000000,"
+        f"-1,0,0,0,100,100,2,0,3,0,0,2,20,20,{margin_v},1\n\n"
+        f"[Events]\n"
+        f"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
 
-    def _render_group_frame(group_words, highlight_idx):
-        """Render a full W×H frame with the caption group, one word highlighted."""
-        sizes = [_measure(w["word"]) for w in group_words]
-        total_text_w = sum(s[0] for s in sizes) + WORD_GAP * (len(sizes) - 1)
-        text_h = max(s[1] for s in sizes)
+    def _fmt(t: float) -> str:
+        t = max(0.0, min(t, max_dur))
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = t % 60
+        return f"{h}:{m:02d}:{s:05.2f}"
 
-        pill_w = total_text_w + PAD_X * 2
-        pill_h = text_h + PAD_Y * 2
-
-        # Full frame, black background (will be used as overlay mask via RGBA)
-        frame = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(frame)
-
-        # Caption zone: 65% down the frame
-        cap_cx = W // 2
-        cap_cy = int(H * 0.65)
-        pill_x0 = cap_cx - pill_w // 2
-        pill_y0 = cap_cy - pill_h // 2
-        pill_x1 = pill_x0 + pill_w
-        pill_y1 = pill_y0 + pill_h
-
-        # Dark semi-transparent background pill
-        draw.rounded_rectangle(
-            [pill_x0, pill_y0, pill_x1, pill_y1],
-            radius=pill_h // 2,
-            fill=(0, 0, 0, 185)
-        )
-
-        # Draw each word
-        x = pill_x0 + PAD_X
-        y = pill_y0 + PAD_Y
-        for wi, w in enumerate(group_words):
-            color = (255, 220, 0) if wi == highlight_idx else (255, 255, 255)
-            draw.text(
-                (x, y), w["word"], font=pil_font,
-                fill=color, stroke_width=STROKE, stroke_fill=(0, 0, 0, 255)
-            )
-            x += sizes[wi][0] + WORD_GAP
-
-        return np.array(frame)
-
-    clips = []
+    lines = []
     for gi in range(0, len(words), GROUP):
         group = words[gi: gi + GROUP]
-        t_start = group[0]["start"]
-        t_end   = group[-1]["end"]
-        if t_start >= max_dur:
-            break
-        t_end = min(t_end, max_dur)
-
         for wi, w in enumerate(group):
-            w_start = max(w["start"], t_start)
-            w_end   = min(w["end"], t_end, max_dur)
-            if w_end - w_start < 0.05:
+            w_start = w["start"]
+            w_end   = min(w["end"], group[-1]["end"], max_dur)
+            if w_start >= max_dur or w_end - w_start < 0.05:
                 continue
-
-            arr = _render_group_frame(group, wi)
-            clip = (
-                ImageClip(arr, is_mask=False)
-                .with_start(w_start)
-                .with_duration(w_end - w_start)
+            # Build text: yellow for current word, white for others
+            parts = []
+            for j, gw in enumerate(group):
+                word = gw["word"].replace("{", "").replace("}", "")  # strip any ASS-breaking chars
+                if j == wi:
+                    parts.append(f"{{\\1c&H0000DCFF&}}{word}{{\\1c&H00FFFFFF&}}")
+                else:
+                    parts.append(word)
+            text = " ".join(parts)
+            lines.append(
+                f"Dialogue: 0,{_fmt(w_start)},{_fmt(w_end)},Caption,,0,0,0,,{text}"
             )
-            clips.append(clip)
 
-    return clips
+    return header + "\n".join(lines) + "\n"
+
+
+def _burn_ass_captions(raw_path: Path, out_path: Path, ass_content: str) -> bool:
+    """Burn ASS subtitles into raw_path → out_path via FFmpeg. Returns True on success."""
+    import tempfile as _tf
+    ass_file = Path(_tf.mktemp(suffix=".ass"))
+    try:
+        ass_file.write_text(ass_content, encoding="utf-8")
+        # Escape path for FFmpeg filter string (Windows backslashes → forward, colons escaped)
+        safe_ass = str(ass_file).replace("\\", "/").replace(":", "\\:")
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(raw_path),
+             "-vf", f"ass='{safe_ass}'",
+             "-c:a", "copy", "-c:v", "libx264", "-crf", "18",
+             str(out_path)],
+            capture_output=True, timeout=180
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+    finally:
+        ass_file.unlink(missing_ok=True)
 
 
 def _render_video_sync(req: "RenderVideoRequest"):
@@ -884,16 +876,9 @@ def _render_video_sync(req: "RenderVideoRequest"):
             mixed = voice_aud
 
         vid = broll.with_audio(mixed)
-
-        # 6. Animated word-by-word captions
         overlays = [vid]
-        try:
-            caption_clips = _build_caption_clips(word_timestamps, max_dur, spec)
-            overlays.extend(caption_clips)
-        except Exception:
-            pass
 
-        # 7. Hook text — big bold top overlay, first 3.5 seconds
+        # Hook text — big bold top overlay, first 3.5 seconds
         hook_text = req.hook or req.script[:60]
         try:
             from moviepy import TextClip
@@ -943,13 +928,33 @@ def _render_video_sync(req: "RenderVideoRequest"):
                 pass
 
         final = CompositeVideoClip(overlays) if len(overlays) > 1 else vid
-        out_path = audio_dir / f"{uid}_{platform}.mp4"
-        final.write_videofile(str(out_path), codec="libx264", audio_codec="aac",
+        out_path  = audio_dir / f"{uid}_{platform}.mp4"
+        raw_path  = audio_dir / f"{uid}_{platform}_raw.mp4"
+
+        # Write video without captions first
+        final.write_videofile(str(raw_path), codec="libx264", audio_codec="aac",
                               fps=spec["fps"], logger=None, threads=2)
         final.close()
         for c in broll_sources:
             try: c.close()
             except Exception: pass
+
+        # Burn captions via FFmpeg ASS filter (no MoviePy compositing bugs)
+        burned = False
+        if word_timestamps:
+            try:
+                ass_content = _build_ass_subtitles(word_timestamps, max_dur, spec)
+                burned = _burn_ass_captions(raw_path, out_path, ass_content)
+            except Exception:
+                burned = False
+
+        if not burned:
+            # No captions or burn failed — use the raw render as-is
+            import shutil
+            shutil.move(str(raw_path), str(out_path))
+        else:
+            raw_path.unlink(missing_ok=True)
+
         urls[platform] = f"https://{PUBLIC_BASE}/media/{out_path.name}"
         captions[platform] = _format_caption(req.script[:500], platform)
 
