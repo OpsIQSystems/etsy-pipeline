@@ -167,35 +167,39 @@ class RotationRequest(BaseModel):
 @app.post("/next_video")
 def next_video(req: RotationRequest):
     """
-    Pick the next video from the rotation pool and render it with UGC voiceover.
-    Pool A = stick videos (products/videos/stick_*.mp4)
-    Pool B = browser demos (products/browser_demos/browser_*.mp4)
-    Alternates A→B→A→B based on a counter file.
+    Pick the next video and render it with UGC voiceover.
+    Browser demos play once through (scenario simulations).
+    Stick videos also play once — no looping ever.
+    Audio is trimmed to match video duration so nothing repeats.
+    Pool alternates browser_demo → stick → browser_demo to keep variety.
     """
     import asyncio, uuid, edge_tts
     from moviepy import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip
-    from moviepy.video.fx import Loop
 
-    pool_a = sorted((BASE / "products" / "videos").glob("stick_*.mp4"))
-    pool_b = sorted((BASE / "products" / "browser_demos").glob("browser_*.mp4"))
+    pool_demos = sorted((BASE / "products" / "browser_demos").glob("browser_*.mp4"))
+    pool_stick = sorted((BASE / "products" / "videos").glob("stick_*.mp4"))
 
     counter_file = BASE / "products" / ".rotation_counter"
     count = int(counter_file.read_text()) if counter_file.exists() else 0
     counter_file.write_text(str(count + 1))
 
-    # A/B alternation; if pool B is empty fall back to A
-    use_browser = (count % 2 == 1) and len(pool_b) > 0
-    pool = pool_b if use_browser else pool_a
-    if not pool:
-        raise HTTPException(status_code=500, detail="No source videos found")
+    # alternate demo → stick → demo; fall back to whichever pool exists
+    if pool_demos and pool_stick:
+        pool = pool_demos if count % 2 == 0 else pool_stick
+    elif pool_demos:
+        pool = pool_demos
+    elif pool_stick:
+        pool = pool_stick
+    else:
+        raise HTTPException(status_code=500, detail="No videos found in browser_demos or videos/")
 
-    # pick video by slug match or by round-robin index
     chosen = pool[count % len(pool)]
     if req.product_slug:
-        slug = req.product_slug
-        match = next((v for v in pool if slug.replace("-","_") in v.stem), None)
-        if match:
-            chosen = match
+        for p in [pool_demos, pool_stick]:
+            match = next((v for v in p if req.product_slug.replace("-", "_") in v.stem), None)
+            if match:
+                chosen = match
+                break
 
     uid = uuid.uuid4().hex
     audio_path = BASE / "products" / "audio" / f"{uid}.mp3"
@@ -208,17 +212,12 @@ def next_video(req: RotationRequest):
     try:
         asyncio.run(_tts())
         audio = AudioFileClip(str(audio_path))
+        video = VideoFileClip(str(chosen))
 
-        if use_browser:
-            # browser demo already has animation — just swap audio
-            video = VideoFileClip(str(chosen))
-            if video.duration < audio.duration:
-                video = Loop(n=10).apply(video).with_duration(audio.duration)
-            else:
-                video = video.subclipped(0, audio.duration)
-        else:
-            video = Loop(n=20).apply(VideoFileClip(str(chosen))).with_duration(audio.duration)
-
+        # trim to whichever is shorter — video plays once, audio matches it
+        duration = min(video.duration, audio.duration)
+        video = video.subclipped(0, duration)
+        audio = audio.subclipped(0, duration)
         video = video.with_audio(audio)
 
         if req.persona_name and req.persona_trade:
@@ -228,7 +227,7 @@ def next_video(req: RotationRequest):
                     TextClip(font=FONT, text=label, font_size=26,
                              color="white", stroke_color="black", stroke_width=2, method="label")
                     .with_position(("center", 0.85), relative=True)
-                    .with_duration(audio.duration)
+                    .with_duration(duration)
                 )
                 video = CompositeVideoClip([video, txt])
             except Exception:
@@ -241,7 +240,7 @@ def next_video(req: RotationRequest):
             "status": "ok",
             "video_path": str(out_path),
             "source_video": chosen.name,
-            "video_type": "browser_demo" if use_browser else "stick",
+            "video_type": "browser_demo" if chosen in pool_demos else "stick",
             "rotation_count": count,
         }
     except Exception as e:
