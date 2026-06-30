@@ -853,9 +853,25 @@ def _render_video_sync(req: "RenderVideoRequest"):
     urls = {}
     captions = {}
 
+    # Group platforms by (w, h, fps) — render once per unique canvas, reuse for same-size platforms.
+    # TikTok/Instagram/YouTube/Facebook are all 1080×1920@30 — render once, copy to others.
+    rendered_canvas: dict[tuple, Path] = {}  # (w, h, fps) → captioned output path
+
+    import shutil
+
     for platform in platforms:
         spec = PLATFORM_SPECS[platform]
         max_dur = min(total_dur, spec["max_sec"])
+        canvas_key = (spec["w"], spec["h"], spec["fps"], round(max_dur))
+
+        out_path = audio_dir / f"{uid}_{platform}.mp4"
+
+        if canvas_key in rendered_canvas:
+            # Same resolution already rendered — just copy the file
+            shutil.copy2(str(rendered_canvas[canvas_key]), str(out_path))
+            urls[platform] = f"https://{PUBLIC_BASE}/media/{out_path.name}"
+            captions[platform] = _format_caption(req.script[:500], platform)
+            continue
 
         # 4. Flash-cut B-roll
         broll, broll_sources = _flash_cut_broll(clip_paths, max_dur, spec)
@@ -893,7 +909,7 @@ def _render_video_sync(req: "RenderVideoRequest"):
         except Exception:
             pass
 
-        # 8. Persona bar — bottom strip
+        # Persona bar — bottom strip
         if req.persona_name and req.persona_trade:
             try:
                 from moviepy import TextClip
@@ -908,7 +924,7 @@ def _render_video_sync(req: "RenderVideoRequest"):
             except Exception:
                 pass
 
-        # 9. Case study card
+        # Case study card
         if req.video_type == "ugc_casestudy" and req.case_study_data:
             try:
                 from moviepy import TextClip
@@ -928,10 +944,9 @@ def _render_video_sync(req: "RenderVideoRequest"):
                 pass
 
         final = CompositeVideoClip(overlays) if len(overlays) > 1 else vid
-        out_path  = audio_dir / f"{uid}_{platform}.mp4"
-        raw_path  = audio_dir / f"{uid}_{platform}_raw.mp4"
+        raw_path = audio_dir / f"{uid}_{platform}_raw.mp4"
 
-        # Write video without captions first
+        # Write base video (no captions yet)
         final.write_videofile(str(raw_path), codec="libx264", audio_codec="aac",
                               fps=spec["fps"], logger=None, threads=2)
         final.close()
@@ -939,7 +954,7 @@ def _render_video_sync(req: "RenderVideoRequest"):
             try: c.close()
             except Exception: pass
 
-        # Burn captions via FFmpeg ASS filter (no MoviePy compositing bugs)
+        # Burn captions via FFmpeg ASS filter
         burned = False
         if word_timestamps:
             try:
@@ -949,12 +964,11 @@ def _render_video_sync(req: "RenderVideoRequest"):
                 burned = False
 
         if not burned:
-            # No captions or burn failed — use the raw render as-is
-            import shutil
             shutil.move(str(raw_path), str(out_path))
         else:
             raw_path.unlink(missing_ok=True)
 
+        rendered_canvas[canvas_key] = out_path
         urls[platform] = f"https://{PUBLIC_BASE}/media/{out_path.name}"
         captions[platform] = _format_caption(req.script[:500], platform)
 
