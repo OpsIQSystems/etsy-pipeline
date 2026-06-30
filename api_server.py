@@ -944,9 +944,9 @@ def _render_video_sync(req: "RenderVideoRequest"):
             cta_start = max(0, max_dur - 3.0)
             shop_url = req.product_url or "https://searchopsiq.etsy.com"
             if req.product_name:
-                cta_text = f"Get: {req.product_name}\nLink in bio  •  {shop_url}"
+                cta_text = f"Get it now ↓\n{req.product_name}\n{shop_url}"
             else:
-                cta_text = f"Link in bio\n{shop_url}"
+                cta_text = f"Get it now ↓\n{shop_url}"
             cta_clip = (
                 TextClip(font=FONT, text=cta_text,
                          font_size=max(32, spec["w"] // 30),
