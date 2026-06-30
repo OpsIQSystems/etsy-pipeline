@@ -1509,6 +1509,205 @@ def add_youtube_card(req: AddYouTubeCardRequest):
     return {"status": "ok", "video_id": video_id, "comment_id": comment_id, "comment": body}
 
 
+# ---------------------------------------------------------------------------
+# Comment engagement bot
+# ---------------------------------------------------------------------------
+# Tracks comment IDs we've already replied to so we never double-reply.
+# Stored in memory — resets on redeploy, but the YouTube API check (has_owner_reply)
+# prevents duplicate replies even after a restart.
+_replied_yt_ids: set[str] = set()
+
+ENGAGE_SYSTEM_PROMPT = """You reply to comments on Unit Unhinged social videos.
+Unit Unhinged sells AI-powered business tools for contractors, landlords, and real-estate investors on Etsy (opsiqsystems.etsy.com).
+
+Rules:
+- Be warm, genuine, and brief (1-3 sentences max).
+- Match the energy of the comment — hype gets hype, a question gets an answer.
+- Never promise features, timelines, discounts, refunds, or any specific outcome.
+- Never guarantee results ("you'll make X", "this will save you Y hours").
+- If someone asks where to get the tool, you may say "grab it on our Etsy shop!" — nothing more specific.
+- If the comment is spam, hate, or completely off-topic, reply with the single word: SKIP
+- Do not use hashtags. Do not use emojis unless the comment itself has them.
+- Write as the brand voice, not as a bot."""
+
+
+def _yt_has_owner_reply(thread: dict, channel_id: str) -> bool:
+    """Return True if the channel owner already replied in this thread."""
+    replies = thread.get("replies", {}).get("comments", [])
+    for r in replies:
+        if r.get("snippet", {}).get("authorChannelId", {}).get("value") == channel_id:
+            return True
+    return False
+
+
+def _claude_reply(comment_text: str) -> str | None:
+    """Generate a reply via Claude. Returns None if the comment should be skipped."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=120,
+        system=ENGAGE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": comment_text}],
+    )
+    text = msg.content[0].text.strip()
+    if text.upper() == "SKIP" or not text:
+        return None
+    return text
+
+
+class EngageCommentsRequest(BaseModel):
+    video_id: str | None = None   # auto-detects latest if omitted
+    max_comments: int = 20        # how many top-level threads to scan
+    fb_post_id: str | None = None # optional Facebook post ID to engage
+    fb_page_token: str | None = None  # Facebook Page access token
+
+
+@app.post("/engage_comments")
+def engage_comments(req: EngageCommentsRequest):
+    """
+    Scan recent comments on YouTube (and optionally Facebook) and reply to any
+    that haven't received a channel-owner reply yet. Uses Claude to generate
+    natural replies. Never promises services or specific outcomes.
+    """
+    import requests as _req
+
+    results = {"youtube": [], "facebook": [], "errors": []}
+
+    # ── YouTube ────────────────────────────────────────────────────────────
+    token = _yt_load_token()
+    if not token.get("access_token"):
+        results["errors"].append("No YouTube token — visit /youtube_auth first")
+    else:
+        token = _yt_refresh_if_needed(token)
+        headers = {"Authorization": f"Bearer {token['access_token']}", "Content-Type": "application/json"}
+
+        # Get channel ID so we can detect owner replies
+        me = _req.get(
+            "https://www.googleapis.com/youtube/v3/channels",
+            params={"part": "id", "mine": "true"},
+            headers=headers, timeout=10,
+        ).json()
+        channel_id = (me.get("items") or [{}])[0].get("id", "")
+
+        # Resolve video_id
+        video_id = req.video_id
+        if not video_id:
+            search = _req.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={"part": "snippet", "forMine": "true", "type": "video", "order": "date", "maxResults": 1},
+                headers=headers, timeout=15,
+            ).json()
+            items = search.get("items", [])
+            if items:
+                video_id = items[0]["id"]["videoId"]
+
+        if video_id:
+            threads_resp = _req.get(
+                "https://www.googleapis.com/youtube/v3/commentThreads",
+                params={
+                    "part": "snippet,replies",
+                    "videoId": video_id,
+                    "maxResults": req.max_comments,
+                    "order": "time",
+                    "textFormat": "plainText",
+                },
+                headers=headers, timeout=15,
+            ).json()
+
+            for thread in threads_resp.get("items", []):
+                thread_id = thread["id"]
+                if thread_id in _replied_yt_ids:
+                    continue
+                if _yt_has_owner_reply(thread, channel_id):
+                    _replied_yt_ids.add(thread_id)
+                    continue
+
+                comment_text = thread["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
+                author = thread["snippet"]["topLevelComment"]["snippet"]["authorDisplayName"]
+
+                try:
+                    reply_text = _claude_reply(comment_text)
+                except Exception as e:
+                    results["errors"].append(f"Claude error on thread {thread_id}: {e}")
+                    continue
+
+                if reply_text is None:
+                    results["youtube"].append({"thread_id": thread_id, "author": author, "action": "skipped"})
+                    _replied_yt_ids.add(thread_id)
+                    continue
+
+                # Post reply
+                parent_id = thread["snippet"]["topLevelComment"]["id"]
+                post_r = _req.post(
+                    "https://www.googleapis.com/youtube/v3/comments?part=snippet",
+                    headers=headers,
+                    json={"snippet": {"parentId": parent_id, "textOriginal": reply_text}},
+                    timeout=20,
+                )
+                if post_r.ok:
+                    _replied_yt_ids.add(thread_id)
+                    results["youtube"].append({
+                        "thread_id": thread_id,
+                        "author": author,
+                        "comment": comment_text[:80],
+                        "reply": reply_text,
+                        "action": "replied",
+                    })
+                else:
+                    results["errors"].append(f"YouTube reply failed for {thread_id}: {post_r.text[:200]}")
+
+    # ── Facebook ───────────────────────────────────────────────────────────
+    if req.fb_post_id and req.fb_page_token:
+        fb_resp = _req.get(
+            f"https://graph.facebook.com/v19.0/{req.fb_post_id}/comments",
+            params={"access_token": req.fb_page_token, "fields": "id,from,message,comments{from,message}", "limit": req.max_comments},
+            timeout=15,
+        ).json()
+
+        for c in fb_resp.get("data", []):
+            cid = c["id"]
+            already_replied = any(
+                sub.get("from", {}).get("name", "").lower() in ("unit unhinged", "opsiq systems", "opsiqsystems")
+                for sub in c.get("comments", {}).get("data", [])
+            )
+            if already_replied:
+                continue
+
+            comment_text = c.get("message", "")
+            author = c.get("from", {}).get("name", "")
+            try:
+                reply_text = _claude_reply(comment_text)
+            except Exception as e:
+                results["errors"].append(f"Claude error on FB comment {cid}: {e}")
+                continue
+
+            if reply_text is None:
+                results["facebook"].append({"comment_id": cid, "author": author, "action": "skipped"})
+                continue
+
+            post_r = _req.post(
+                f"https://graph.facebook.com/v19.0/{cid}/comments",
+                params={"access_token": req.fb_page_token},
+                json={"message": reply_text},
+                timeout=20,
+            )
+            if post_r.ok:
+                results["facebook"].append({
+                    "comment_id": cid,
+                    "author": author,
+                    "comment": comment_text[:80],
+                    "reply": reply_text,
+                    "action": "replied",
+                })
+            else:
+                results["errors"].append(f"Facebook reply failed for {cid}: {post_r.text[:200]}")
+    elif req.fb_post_id:
+        results["errors"].append("fb_page_token required to engage Facebook comments")
+
+    return results
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
