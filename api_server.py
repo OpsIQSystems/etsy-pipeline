@@ -1170,6 +1170,7 @@ class PostSocialRequest(BaseModel):
     facebook_caption: str = ""
     bluesky_caption: str = ""
     schedule_at: str | None = None  # ISO8601 — None = post immediately
+    etsy_url: str = "https://searchopsiq.etsy.com"
 
 
 @app.post("/post_social")
@@ -1191,6 +1192,7 @@ def post_social(req: PostSocialRequest):
     }
 
     results = {}
+    youtube_posted = False
     for platform, (video_url, caption) in platform_map.items():
         if not video_url:
             continue
@@ -1209,8 +1211,51 @@ def post_social(req: PostSocialRequest):
             except Exception:
                 body = r.text
             results[platform] = {"status": r.status_code, "body": body}
+            if platform == "youtube" and r.status_code in (200, 201):
+                youtube_posted = True
         except Exception as e:
             results[platform] = {"status": "error", "error": str(e)}
+
+    # Fire background thread to post Etsy link comment on YouTube after upload processes
+    if youtube_posted and _YT_TOKEN_FILE.exists():
+        import threading
+        etsy_url = req.etsy_url
+
+        def _yt_comment_bg():
+            try:
+                import time as _t, requests as _r2
+                _t.sleep(90)  # wait for YouTube to finish processing the upload
+                token = _yt_load_token()
+                token = _yt_refresh_if_needed(token)
+                headers2 = {"Authorization": f"Bearer {token['access_token']}"}
+                # Get most recently uploaded video on this channel
+                search = _r2.get(
+                    "https://www.googleapis.com/youtube/v3/search",
+                    params={"part": "snippet", "forMine": "true", "type": "video",
+                            "order": "date", "maxResults": 1},
+                    headers=headers2, timeout=15,
+                ).json()
+                items = search.get("items", [])
+                if not items:
+                    print("[yt_comment_bg] No videos found on channel")
+                    return
+                video_id = items[0]["id"]["videoId"]
+                comment_text = f"🔗 Get it here → {etsy_url}"
+                # Post comment
+                ct_resp = _r2.post(
+                    "https://www.googleapis.com/youtube/v3/commentThreads",
+                    params={"part": "snippet"},
+                    json={"snippet": {"videoId": video_id, "topLevelComment": {
+                        "snippet": {"textOriginal": comment_text}
+                    }}},
+                    headers={**headers2, "Content-Type": "application/json"},
+                    timeout=15,
+                )
+                print(f"[yt_comment_bg] Comment posted: {ct_resp.status_code} video={video_id}")
+            except Exception as _e:
+                print(f"[yt_comment_bg] Error: {_e}")
+
+        threading.Thread(target=_yt_comment_bg, daemon=True).start()
 
     return {"status": "ok", "results": results}
 
