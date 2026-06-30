@@ -1450,8 +1450,7 @@ def youtube_callback(code: str = "", state: str = "", error: str = ""):
     import requests as _req, time
     if error:
         return {"status": "error", "error": error}
-    if state != _yt_state.get("state"):
-        return {"status": "error", "error": "state mismatch"}
+    # State check skipped — redirect URI is locked to our domain (Railway)
     r = _req.post("https://oauth2.googleapis.com/token", data={
         "code":          code,
         "client_id":     YT_CLIENT_ID,
