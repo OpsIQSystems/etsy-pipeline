@@ -187,6 +187,7 @@ class PostForMePoster:
 
         # Map platform name → PostForMe account id
         ACCOUNT_IDS = {
+            "facebook":  "1166305113238810",
             "youtube":   "UC04oCwObnayhYjHMyUMzFwg",
             "instagram": "17841425222986458",
             "tiktok":    "-000nHuLr7f6aG2up5DjIH5DOQfkUiNsR9F6",
