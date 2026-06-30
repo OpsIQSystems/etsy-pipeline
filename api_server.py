@@ -676,28 +676,153 @@ def render_video(req: RenderVideoRequest, background_tasks=None):
     return {"status": "pending", "job_id": job_id, "poll_url": f"https://{PUBLIC_BASE}/render_video/{job_id}"}
 
 
+def _get_word_timestamps(text: str, voice: str) -> tuple[bytes, list[dict]]:
+    """Run edge-tts and collect audio bytes + per-word timestamps."""
+    import asyncio, edge_tts
+
+    audio_chunks: list[bytes] = []
+    words: list[dict] = []
+
+    async def _stream():
+        comm = edge_tts.Communicate(text, voice)
+        async for event in comm.stream():
+            if event["type"] == "audio":
+                audio_chunks.append(event["data"])
+            elif event["type"] == "WordBoundary":
+                words.append({
+                    "word":  event["text"],
+                    "start": event["offset"] / 10_000_000,
+                    "end":   (event["offset"] + event["duration"]) / 10_000_000,
+                })
+
+    asyncio.run(_stream())
+    return b"".join(audio_chunks), words
+
+
+def _build_caption_clips(words: list[dict], max_dur: float, spec: dict) -> list:
+    """
+    Group words into 3-word caption blocks. Each block pops on screen as a
+    bold centered overlay. Current-speaking words are yellow, rest white.
+    Returns list of moviepy ImageClips.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    from moviepy import ImageClip
+
+    if not words:
+        return []
+
+    W, H = spec["w"], spec["h"]
+    FONT_SIZE = max(54, W // 18)
+    PADDING = 20
+    try:
+        pil_font = ImageFont.truetype(FONT, FONT_SIZE)
+        pil_font_small = ImageFont.truetype(FONT, max(36, FONT_SIZE - 14))
+    except Exception:
+        pil_font = ImageFont.load_default()
+        pil_font_small = pil_font
+
+    def _word_img(text: str, highlight: bool) -> Image.Image:
+        color = (255, 220, 0) if highlight else (255, 255, 255)  # yellow or white
+        stroke = (0, 0, 0)
+        dummy = Image.new("RGBA", (1, 1))
+        d = ImageDraw.Draw(dummy)
+        bbox = d.textbbox((0, 0), text, font=pil_font, stroke_width=3)
+        tw = bbox[2] - bbox[0] + PADDING * 2
+        th = bbox[3] - bbox[1] + PADDING
+        img = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+        d2 = ImageDraw.Draw(img)
+        d2.text((PADDING, PADDING // 2), text, font=pil_font,
+                fill=color, stroke_width=3, stroke_fill=stroke)
+        return img
+
+    clips = []
+    GROUP = 3  # words per caption block
+
+    for gi in range(0, len(words), GROUP):
+        group = words[gi: gi + GROUP]
+        t_start = group[0]["start"]
+        t_end   = group[-1]["end"]
+        if t_start >= max_dur:
+            break
+        t_end = min(t_end, max_dur)
+        duration = t_end - t_start
+        if duration < 0.1:
+            continue
+
+        # Build a composite PIL image of the group (words side by side)
+        word_imgs = [_word_img(w["word"], False) for w in group]
+        total_w = sum(img.width for img in word_imgs) + 10 * (len(word_imgs) - 1)
+        max_h   = max(img.height for img in word_imgs)
+
+        # One image per word-within-group highlight state is too many clips.
+        # Instead render group as static block; highlight switches per word.
+        for wi, w in enumerate(group):
+            w_start = max(w["start"], t_start)
+            w_end   = min(w["end"], t_end, max_dur)
+            if w_end <= w_start:
+                continue
+
+            # Rebuild group with this word highlighted
+            wimgs = [_word_img(gw["word"], j == wi) for j, gw in enumerate(group)]
+            tw = sum(img.width for img in wimgs) + 10 * (len(wimgs) - 1)
+            th = max(img.height for img in wimgs)
+            canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+            x = 0
+            for wimg in wimgs:
+                canvas.paste(wimg, (x, (th - wimg.height) // 2), wimg)
+                x += wimg.width + 10
+
+            # Scale down if wider than frame
+            if canvas.width > W - 40:
+                scale = (W - 40) / canvas.width
+                canvas = canvas.resize(
+                    (int(canvas.width * scale), int(canvas.height * scale)),
+                    Image.LANCZOS
+                )
+
+            import numpy as np
+            arr = np.array(canvas)
+            clip = (
+                ImageClip(arr, is_mask=False)
+                .with_start(w_start)
+                .with_duration(w_end - w_start)
+                .with_position(("center", 0.72), relative=True)
+            )
+            clips.append(clip)
+
+    return clips
+
+
 def _render_video_sync(req: "RenderVideoRequest"):
     """Actual render logic — runs in background thread."""
-    import asyncio, uuid, requests, tempfile
-    import edge_tts
-    from moviepy import AudioFileClip, TextClip, CompositeVideoClip
+    import uuid, requests, tempfile
+    from moviepy import AudioFileClip, AudioClip, CompositeVideoClip, CompositeAudioClip
+    import io
 
     uid = uuid.uuid4().hex
     audio_dir = BASE / "products" / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp())
 
-    # 1. TTS
+    # 1. TTS with word timestamps
+    audio_bytes, word_timestamps = _get_word_timestamps(req.script, req.voice)
     audio_path = audio_dir / f"{uid}.mp3"
-
-    async def _tts():
-        await edge_tts.Communicate(req.script, req.voice).save(str(audio_path))
-
-    asyncio.run(_tts())
+    audio_path.write_bytes(audio_bytes)
     audio_master = AudioFileClip(str(audio_path))
-    total_dur = min(audio_master.duration, 58)  # cap at 58s for safety
+    total_dur = min(audio_master.duration, 58)
 
-    # 2. Pexels B-roll search
+    # 2. Background music — download a royalty-free lo-fi track
+    music_path = BASE / "products" / "audio" / "bg_music.mp3"
+    if not music_path.exists():
+        MUSIC_URL = "https://www.chosic.com/wp-content/uploads/2021/07/Lofi-Study-original-chosic.com_.mp3"
+        try:
+            r = requests.get(MUSIC_URL, timeout=20, stream=True)
+            if r.status_code == 200:
+                music_path.write_bytes(r.content)
+        except Exception:
+            pass
+
+    # 3. Pexels B-roll
     if req.broll_query:
         query = req.broll_query
     elif req.video_type == "humor":
@@ -709,12 +834,9 @@ def _render_video_sync(req: "RenderVideoRequest"):
         query = terms[0]
 
     clip_urls = _pexels_fetch_videos(query, count=6, orientation="portrait")
-
-    # fallback to landscape if portrait has no results
     if not clip_urls:
         clip_urls = _pexels_fetch_videos(query, count=6, orientation="landscape")
 
-    # fallback to local stock if Pexels returns nothing
     if not clip_urls:
         local_pool = (
             sorted((BASE / "products" / "browser_demos").glob("browser_*.mp4")) +
@@ -722,7 +844,6 @@ def _render_video_sync(req: "RenderVideoRequest"):
         )
         clip_paths = local_pool[:6] if local_pool else []
     else:
-        # download clips to tmp
         clip_paths = []
         for i, url in enumerate(clip_urls):
             dest = tmp_dir / f"broll_{i}.mp4"
@@ -730,7 +851,7 @@ def _render_video_sync(req: "RenderVideoRequest"):
                 clip_paths.append(dest)
 
     if not clip_paths:
-        raise HTTPException(status_code=500, detail="No B-roll clips available (Pexels + local fallback both empty)")
+        raise HTTPException(status_code=500, detail="No B-roll clips available")
 
     platforms = [p for p in req.platforms if p in PLATFORM_SPECS] or ALL_PLATFORMS
     urls = {}
@@ -740,64 +861,80 @@ def _render_video_sync(req: "RenderVideoRequest"):
         spec = PLATFORM_SPECS[platform]
         max_dur = min(total_dur, spec["max_sec"])
 
-        # 3. Flash-cut composite — source clips must stay open until after write_videofile
+        # 4. Flash-cut B-roll
         broll, broll_sources = _flash_cut_broll(clip_paths, max_dur, spec)
         broll = broll.with_duration(max_dur)
 
-        # 4. Audio
-        aud = audio_master.subclipped(0, max_dur)
-        vid = broll.with_audio(aud)
-
-        # 5. Overlays
-        overlays = [vid]
-
-        # Hook text at top (first 3 seconds)
-        hook_text = req.hook or req.script[:80]
+        # 5. Mix audio: TTS voice + soft background music
+        voice_aud = audio_master.subclipped(0, max_dur)
         try:
+            if music_path.exists():
+                from moviepy import AudioFileClip as AFC
+                music_clip = AFC(str(music_path)).subclipped(0, max_dur).with_effects(
+                    [__import__('moviepy').audio.fx.MultiplyVolume(0.12)]
+                )
+                mixed = CompositeAudioClip([voice_aud, music_clip])
+            else:
+                mixed = voice_aud
+        except Exception:
+            mixed = voice_aud
+
+        vid = broll.with_audio(mixed)
+
+        # 6. Animated word-by-word captions
+        overlays = [vid]
+        try:
+            caption_clips = _build_caption_clips(word_timestamps, max_dur, spec)
+            overlays.extend(caption_clips)
+        except Exception:
+            pass
+
+        # 7. Hook text — big bold top overlay, first 3.5 seconds
+        hook_text = req.hook or req.script[:60]
+        try:
+            from moviepy import TextClip
             hook_clip = (
-                TextClip(font=FONT, text=hook_text, font_size=38, color="white",
-                         stroke_color="black", stroke_width=3, method="caption",
-                         size=(spec["w"] - 60, None))
-                .with_position(("center", 0.08), relative=True)
+                TextClip(font=FONT, text=hook_text, font_size=max(42, spec["w"] // 22),
+                         color="white", stroke_color="black", stroke_width=4,
+                         method="caption", size=(spec["w"] - 40, None))
+                .with_position(("center", 0.06), relative=True)
                 .with_duration(min(3.5, max_dur))
             )
             overlays.append(hook_clip)
         except Exception:
             pass
 
-        # Persona name bar (bottom)
+        # 8. Persona bar — bottom strip
         if req.persona_name and req.persona_trade:
-            label = f"{req.persona_name}  ·  {req.persona_trade}"
             try:
+                from moviepy import TextClip
+                label = f"{req.persona_name}  ·  {req.persona_trade}"
                 name_clip = (
-                    TextClip(font=FONT, text=label, font_size=30, color="white",
+                    TextClip(font=FONT, text=label, font_size=32, color="white",
                              stroke_color="black", stroke_width=2, method="label")
-                    .with_position(("center", 0.88), relative=True)
+                    .with_position(("center", 0.92), relative=True)
                     .with_duration(max_dur)
                 )
                 overlays.append(name_clip)
             except Exception:
                 pass
 
-        # Case study data card (ugc_casestudy type — show at 3s)
+        # 9. Case study card
         if req.video_type == "ugc_casestudy" and req.case_study_data:
             try:
+                from moviepy import TextClip
                 lines = [f"{k.replace('_',' ').title()}: ${v:,}" if isinstance(v, (int, float))
                          else f"{k.replace('_',' ').title()}: {v}"
                          for k, v in req.case_study_data.items()]
-                card_text = "\n".join(lines)
-                card_start = min(3.0, max_dur * 0.3)
-                card_dur = min(4.0, max_dur - card_start)
-                if card_dur > 0.5:
-                    card_clip = (
-                        TextClip(font=FONT, text=card_text, font_size=34, color="#00FF88",
-                                 stroke_color="black", stroke_width=2, method="caption",
-                                 size=(spec["w"] - 80, None))
-                        .with_position(("center", 0.45), relative=True)
-                        .with_start(card_start)
-                        .with_duration(card_dur)
-                    )
-                    overlays.append(card_clip)
+                card_clip = (
+                    TextClip(font=FONT, text="\n".join(lines), font_size=36,
+                             color="#00FF88", stroke_color="black", stroke_width=2,
+                             method="caption", size=(spec["w"] - 80, None))
+                    .with_position(("center", 0.42), relative=True)
+                    .with_start(min(3.0, max_dur * 0.3))
+                    .with_duration(min(4.0, max_dur * 0.4))
+                )
+                overlays.append(card_clip)
             except Exception:
                 pass
 
@@ -805,7 +942,6 @@ def _render_video_sync(req: "RenderVideoRequest"):
         out_path = audio_dir / f"{uid}_{platform}.mp4"
         final.write_videofile(str(out_path), codec="libx264", audio_codec="aac",
                               fps=spec["fps"], logger=None, threads=2)
-        # Close AFTER write_videofile so lazy readers can still access source frames
         final.close()
         for c in broll_sources:
             try: c.close()
@@ -813,11 +949,13 @@ def _render_video_sync(req: "RenderVideoRequest"):
         urls[platform] = f"https://{PUBLIC_BASE}/media/{out_path.name}"
         captions[platform] = _format_caption(req.script[:500], platform)
 
-    # cleanup
+    # cleanup tmp
     audio_path.unlink(missing_ok=True)
     for p in tmp_dir.iterdir():
-        p.unlink(missing_ok=True)
-    tmp_dir.rmdir()
+        try: p.unlink()
+        except Exception: pass
+    try: tmp_dir.rmdir()
+    except Exception: pass
 
     return {
         "status": "ok",
