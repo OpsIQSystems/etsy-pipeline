@@ -632,6 +632,7 @@ class RenderVideoRequest(BaseModel):
     persona_name: str | None = None
     persona_trade: str | None = None
     product_name: str | None = None
+    product_url: str | None = None     # specific Etsy listing URL for CTA
     case_study_data: dict | None = None  # e.g. {"job_value": 14200, "profit": 2800}
     voice: str = "en-US-GuyNeural"
     platforms: list[str] = ALL_PLATFORMS
@@ -924,13 +925,18 @@ def _render_video_sync(req: "RenderVideoRequest"):
             except Exception:
                 pass
 
-        # CTA card — last 3 seconds, points to shop
+        # CTA card — last 3 seconds, points to specific product
         try:
             from moviepy import TextClip
             cta_start = max(0, max_dur - 3.0)
+            shop_url = req.product_url or "searchopsiq.etsy.com"
+            if req.product_name:
+                cta_text = f"Get: {req.product_name}\nLink in bio  •  {shop_url}"
+            else:
+                cta_text = f"Link in bio\n{shop_url}"
             cta_clip = (
-                TextClip(font=FONT, text="🔗 Link in bio\nsearchopsiq.etsy.com",
-                         font_size=max(34, spec["w"] // 28),
+                TextClip(font=FONT, text=cta_text,
+                         font_size=max(32, spec["w"] // 30),
                          color="#FFE600", stroke_color="black", stroke_width=3,
                          method="caption", size=(spec["w"] - 60, None))
                 .with_position(("center", 0.80), relative=True)
