@@ -12,12 +12,19 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 app = FastAPI(title="Etsy Pipeline API", version="1.0.0")
 
-BASE   = Path(__file__).parent
-PYTHON = os.environ.get("PYTHON_BIN", r"C:\Users\Ron39\AppData\Local\Programs\Python\Python312\python.exe")
+BASE        = Path(__file__).parent
+PYTHON      = os.environ.get("PYTHON_BIN", r"C:\Users\Ron39\AppData\Local\Programs\Python\Python312\python.exe")
+PUBLIC_BASE = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "etsy-pipeline-production.up.railway.app")
+
+# Serve rendered videos publicly so PostForMe can download them
+_media_dir = BASE / "products" / "audio"
+_media_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=str(_media_dir)), name="media")
 FONT   = os.environ.get("FONT_PATH", r"C:\Windows\Fonts\arialbd.ttf")
 
 
@@ -236,9 +243,12 @@ def next_video(req: RotationRequest):
         video.write_videofile(str(out_path), codec="libx264", audio_codec="aac",
                               logger=None, threads=2)
         audio_path.unlink(missing_ok=True)
+        filename = out_path.name
+        public_url = f"https://{PUBLIC_BASE}/media/{filename}"
         return {
             "status": "ok",
             "video_path": str(out_path),
+            "video_url": public_url,
             "source_video": chosen.name,
             "video_type": "browser_demo" if chosen in pool_demos else "stick",
             "rotation_count": count,
