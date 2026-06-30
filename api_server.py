@@ -976,6 +976,59 @@ def _render_video_sync(req: "RenderVideoRequest"):
     }
 
 
+# ---------------------------------------------------------------------------
+# /scrape  — competitor + trend scraping (replaces Apify actors)
+# ---------------------------------------------------------------------------
+
+class ScrapeRequest(BaseModel):
+    reddit_subreddits: list[str] | None = None
+    reddit_limit: int = 25
+    reddit_sort: str = "hot"
+    tiktok_hashtags: list[str] | None = None
+    tiktok_limit: int = 20
+    etsy_competitors: list[str] | None = None   # list of Etsy shop URLs
+    skip_reddit: bool = False
+    skip_tiktok: bool = False
+
+
+_scrape_jobs: dict = {}
+
+
+def _run_scrape_job(job_id: str, config: dict):
+    try:
+        import sys
+        sys.path.insert(0, str(BASE))
+        from competitor_scraper import run_all
+        result = run_all(config)
+        _scrape_jobs[job_id] = {"status": "done", "result": result}
+    except Exception as e:
+        _scrape_jobs[job_id] = {"status": "error", "error": str(e)}
+
+
+@app.post("/scrape")
+def scrape(req: ScrapeRequest):
+    """
+    Start a competitor/trend scrape. Returns job_id — poll GET /scrape/{job_id}.
+    Replaces Apify actors with zero per-run cost.
+    """
+    import uuid, threading
+    job_id = uuid.uuid4().hex
+    config = req.model_dump()
+    _scrape_jobs[job_id] = {"status": "pending"}
+    t = threading.Thread(target=_run_scrape_job, args=(job_id, config), daemon=True)
+    t.start()
+    return {"status": "pending", "job_id": job_id,
+            "poll_url": f"https://{PUBLIC_BASE}/scrape/{job_id}"}
+
+
+@app.get("/scrape/{job_id}")
+def scrape_status(job_id: str):
+    job = _scrape_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
