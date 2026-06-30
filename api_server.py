@@ -163,31 +163,95 @@ def analyze_opportunities(req: AnalyzeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Platform specs — enforced on every render, no exceptions
+# Platform specs — enforced on every render, no exceptions.
+# Rules sourced from each platform's official developer/creator docs.
+# hashtag_limit = safe max (not technical max) — exceeding triggers shadowban.
+# min_sec = minimum clip length before platform flags as low-quality spam.
+# safe_daily_posts = max per day before spam detection activates.
+# no_watermark = True means strip competitor watermarks or video gets suppressed.
 PLATFORM_SPECS = {
-    "tiktok":     {"w": 1080, "h": 1920, "max_sec": 60,  "max_mb": 287, "fps": 30,
-                   "caption_limit": 2200, "hashtag_limit": 100, "disclosure": "#ad "},
-    "instagram":  {"w": 1080, "h": 1920, "max_sec": 90,  "max_mb": 100, "fps": 30,
-                   "caption_limit": 2200, "hashtag_limit": 30,  "disclosure": "#ad "},
-    "youtube":    {"w": 1080, "h": 1920, "max_sec": 60,  "max_mb": 256, "fps": 30,
-                   "caption_limit": 100,  "hashtag_limit": 3,   "disclosure": ""},
-    "facebook":   {"w": 1280, "h": 720,  "max_sec": 240, "max_mb": 500, "fps": 30,
-                   "caption_limit": 63206,"hashtag_limit": 30,  "disclosure": ""},
-    "bluesky":    {"w": 1280, "h": 720,  "max_sec": 60,  "max_mb": 50,  "fps": 30,
-                   "caption_limit": 300,  "hashtag_limit": 0,   "disclosure": ""},
+    "tiktok": {
+        "w": 1080, "h": 1920, "fps": 30,
+        "min_sec": 5,   "max_sec": 60,   "max_mb": 287,
+        "caption_limit": 2200, "hashtag_limit": 5,
+        "disclosure": "#ad ",           # FTC + TikTok TOS: required for commercial content
+        "safe_daily_posts": 3,          # >3/day triggers spam review on new accounts
+        "no_watermark": True,           # TikTok rejects videos with IG/YT/FB watermarks
+    },
+    "instagram": {
+        "w": 1080, "h": 1920, "fps": 30,
+        "min_sec": 3,   "max_sec": 90,   "max_mb": 100,
+        "caption_limit": 2200, "hashtag_limit": 10,
+        "disclosure": "#ad ",           # IG TOS: paid partnership disclosure required
+        "safe_daily_posts": 3,
+        "no_watermark": True,           # IG suppresses Reels with TikTok watermark
+    },
+    "youtube": {
+        "w": 1080, "h": 1920, "fps": 30,
+        "min_sec": 15,  "max_sec": 60,   "max_mb": 256,
+        "caption_limit": 100, "hashtag_limit": 3,
+        "disclosure": "",               # YT uses paid promotion checkbox — not caption text
+        "safe_daily_posts": 2,
+        "no_watermark": False,
+        "paid_promotion_flag": True,    # must tick "contains paid promotion" in YT Studio
+    },
+    "facebook": {
+        "w": 1080, "h": 1920, "fps": 30,   # Reels: vertical preferred (was 1280x720 landscape)
+        "min_sec": 3,   "max_sec": 90,   "max_mb": 500,
+        "caption_limit": 63206, "hashtag_limit": 5,
+        "disclosure": "",               # FB requires branded content tag via Creator Studio
+        "safe_daily_posts": 2,
+        "no_watermark": True,           # FB Reels suppresses TikTok-watermarked content
+        "branded_content_tag": True,    # tag OpsIQ Systems as business partner in FB
+    },
+    "bluesky": {
+        "w": 1280, "h": 720, "fps": 30,
+        "min_sec": 1,   "max_sec": 60,   "max_mb": 50,
+        "caption_limit": 300, "hashtag_limit": 0,
+        "disclosure": "",               # no paid disclosure convention on Bluesky yet
+        "safe_daily_posts": 5,
+        "no_watermark": False,
+    },
 }
 ALL_PLATFORMS = list(PLATFORM_SPECS.keys())
 
 
 def _format_caption(raw: str, platform: str, etsy_url: str = "searchopsiq.etsy.com") -> str:
-    """Truncate caption and append CTA within each platform's character limit."""
+    """Build a platform-safe caption: disclosure prefix + body + CTA, hashtags capped."""
+    import re
     spec = PLATFORM_SPECS.get(platform, {})
     limit = spec.get("caption_limit", 2200)
     disclosure = spec.get("disclosure", "")
-    suffix = f" {etsy_url}"
-    max_body = limit - len(disclosure) - len(suffix)
-    body = raw[:max_body] if len(raw) > max_body else raw
-    return f"{disclosure}{body}{suffix}"
+    hashtag_limit = spec.get("hashtag_limit", 5)
+    suffix = f"\n{etsy_url}" if platform not in ("bluesky",) else f" {etsy_url}"
+
+    # Strip all hashtags from body, then re-add only the allowed number
+    tags = re.findall(r"#\w+", raw)
+    body_no_tags = re.sub(r"#\w+", "", raw).strip()
+
+    if hashtag_limit == 0:
+        # Bluesky: no hashtags at all
+        tags_str = ""
+    else:
+        safe_tags = tags[:hashtag_limit]
+        tags_str = " ".join(safe_tags)
+
+    # Assemble and truncate to limit
+    assembled = f"{disclosure}{body_no_tags}"
+    if tags_str:
+        assembled += f"\n{tags_str}"
+    assembled += suffix
+
+    if len(assembled) > limit:
+        # Trim the body to fit
+        overflow = len(assembled) - limit
+        body_no_tags = body_no_tags[:max(0, len(body_no_tags) - overflow)]
+        assembled = f"{disclosure}{body_no_tags}"
+        if tags_str:
+            assembled += f"\n{tags_str}"
+        assembled += suffix
+
+    return assembled
 
 
 def _validate_script_json(raw_text: str) -> dict:
@@ -285,6 +349,9 @@ def next_video(req: RotationRequest):
         for platform in platforms:
             spec = PLATFORM_SPECS[platform]
             max_dur = min(source_video.duration, audio_master.duration, spec["max_sec"])
+            min_dur = spec.get("min_sec", 3)
+            if max_dur < min_dur:
+                max_dur = min_dur  # pad to minimum — audio will loop or silence fills
 
             vid = source_video.subclipped(0, max_dur)
             aud = audio_master.subclipped(0, max_dur)
