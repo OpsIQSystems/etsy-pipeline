@@ -1,0 +1,11 @@
+.env
+__pycache__
+*.pyc
+*.pyo
+.git
+products/audio/
+products/browser_demos/
+*.mp4
+*.mp3
+*.webm
+youtube_token.json

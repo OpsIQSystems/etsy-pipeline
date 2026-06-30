@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title id="page-title">OpsIQ Systems — Product Demo</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Segoe UI', sans-serif;
+  background: #0d1117;
+  color: #c9d1d9;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 18px 12px 24px;
+}
+.header { text-align: center; margin-bottom: 18px; }
+.header h1 { font-size: 18px; color: #58a6ff; font-weight: 600; letter-spacing: 0.5px; }
+.header p { font-size: 12px; color: #8b949e; margin-top: 4px; }
+.sheet {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  overflow: hidden;
+  width: 100%;
+  max-width: 640px;
+}
+.title-bar {
+  background: #0d1117;
+  padding: 8px 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid #30363d;
+}
+.dot { width: 10px; height: 10px; border-radius: 50%; }
+.dot.r { background: #ff5f57; }
+.dot.y { background: #febc2e; }
+.dot.g { background: #28c840; }
+.title-bar span { margin-left: 8px; font-size: 11px; color: #484f58; }
+.progress { height: 2px; background: #21262d; }
+.progress-fill { height: 100%; background: #58a6ff; width: 0; transition: width 0.25s ease; }
+table { width: 100%; border-collapse: collapse; }
+th {
+  background: #0d1117;
+  color: #8b949e;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  padding: 6px 14px;
+  text-align: left;
+  border-bottom: 1px solid #30363d;
+  font-weight: 500;
+}
+td { padding: 8px 14px; border-bottom: 1px solid #21262d; font-size: 13px; }
+.lbl { color: #8b949e; width: 52%; }
+.val { color: #e6edf3; font-weight: 600; font-family: 'Courier New', monospace; }
+.calc { color: #58a6ff; font-weight: 600; font-family: 'Courier New', monospace; }
+.sec td {
+  background: #0d1117 !important;
+  color: #484f58;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  padding: 5px 14px;
+  border: none;
+  font-family: 'Segoe UI', sans-serif;
+  font-weight: 500;
+}
+.cursor {
+  display: inline-block;
+  width: 1px;
+  height: 13px;
+  background: #58a6ff;
+  vertical-align: middle;
+  margin-left: 1px;
+  animation: blink 0.7s step-end infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+.verdict-badge {
+  display: inline-block;
+  padding: 8px 22px;
+  border-radius: 6px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  opacity: 0;
+  transform: scale(0.85);
+  transition: opacity 0.4s ease, transform 0.4s cubic-bezier(0.175,0.885,0.32,1.275);
+}
+.verdict-badge.show { opacity: 1; transform: scale(1); }
+.verdict-success { background: #0d4429; color: #3fb950; border: 1px solid #238636; }
+.verdict-warning { background: #3a2000; color: #e3b341; border: 1px solid #9e6a03; }
+.verdict-danger  { background: #3d1c1c; color: #f85149; border: 1px solid #6e1a1a; }
+.profit-val { font-size: 16px; font-weight: 700; font-family: 'Courier New', monospace; }
+.profit-success { color: #3fb950; }
+.profit-warning { color: #e3b341; }
+.profit-danger  { color: #f85149; }
+.verdict-cell { padding: 14px 14px !important; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1 id="hdr-title">Loading...</h1>
+  <p id="hdr-tagline">OpsIQ Systems</p>
+</div>
+<div class="sheet">
+  <div class="title-bar">
+    <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
+    <span id="bar-title">Loading product...</span>
+  </div>
+  <div class="progress"><div class="progress-fill" id="prog"></div></div>
+  <table>
+    <tr><th>Field</th><th>Your input</th><th>Calculated</th></tr>
+    <tr class="sec"><td colspan="3">Inputs</td></tr>
+    <tbody id="input-rows"></tbody>
+    <tr class="sec"><td colspan="3">Results</td></tr>
+    <tbody id="output-rows"></tbody>
+    <tr class="sec"><td colspan="3">Verdict</td></tr>
+    <tr>
+      <td class="lbl">Decision</td>
+      <td class="verdict-cell" colspan="2"><span class="verdict-badge" id="verdict-badge"></span></td>
+    </tr>
+    <tr id="profit-row">
+      <td class="lbl">Bottom line</td>
+      <td class="verdict-cell" colspan="2"><span class="profit-val" id="profit-val"></span></td>
+    </tr>
+  </table>
+</div>
+
+<script>
+const CONFIG = window.__PRODUCT_CONFIG__;
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function setProgress(p) { document.getElementById('prog').style.width = p + '%'; }
+
+async function typeInto(el, text, speed) {
+  const cur = document.createElement('span');
+  cur.className = 'cursor';
+  el.innerHTML = '';
+  el.appendChild(cur);
+  for (let i = 0; i < text.length; i++) {
+    el.textContent = text.slice(0, i + 1);
+    el.appendChild(cur);
+    await sleep(speed + Math.random() * 30);
+  }
+  el.removeChild(cur);
+  el.textContent = text;
+}
+
+async function run() {
+  if (!CONFIG) return;
+
+  document.getElementById('hdr-title').textContent = CONFIG.title;
+  document.getElementById('hdr-tagline').textContent = CONFIG.tagline + ' · OpsIQ Systems';
+  document.getElementById('bar-title').textContent = CONFIG.title + '.xlsx — Google Sheets';
+  document.title = CONFIG.title + ' — OpsIQ Systems';
+
+  const inputBody = document.getElementById('input-rows');
+  const outputBody = document.getElementById('output-rows');
+
+  CONFIG.inputs.forEach(([lbl]) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td class="lbl">${lbl}</td><td class="val" id="inp-${lbl.replace(/\W/g,'_')}"></td><td></td>`;
+    inputBody.appendChild(tr);
+  });
+  CONFIG.outputs.forEach(([lbl]) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td class="lbl">${lbl}</td><td></td><td class="calc" id="out-${lbl.replace(/\W/g,'_')}"></td>`;
+    outputBody.appendChild(tr);
+  });
+
+  const badge = document.getElementById('verdict-badge');
+  badge.className = 'verdict-badge verdict-' + CONFIG.verdict_type;
+  badge.textContent = CONFIG.verdict;
+
+  await sleep(1000);
+  setProgress(8);
+
+  const step = 62 / CONFIG.inputs.length;
+  for (let i = 0; i < CONFIG.inputs.length; i++) {
+    const [lbl, val] = CONFIG.inputs[i];
+    const el = document.getElementById('inp-' + lbl.replace(/\W/g,'_'));
+    if (el) await typeInto(el, val, 70);
+    setProgress(8 + (i + 1) * step);
+    await sleep(200 + Math.random() * 100);
+  }
+  await sleep(600);
+
+  const outStep = 22 / CONFIG.outputs.length;
+  for (let i = 0; i < CONFIG.outputs.length; i++) {
+    const [lbl, val] = CONFIG.outputs[i];
+    const el = document.getElementById('out-' + lbl.replace(/\W/g,'_'));
+    if (el) { await sleep(300); el.textContent = val; }
+    setProgress(70 + (i + 1) * outStep);
+  }
+  await sleep(700);
+
+  badge.classList.add('show');
+  setProgress(96);
+  await sleep(450);
+
+  const profitEl = document.getElementById('profit-val');
+  profitEl.textContent = CONFIG.profit;
+  profitEl.className = 'profit-val profit-' + CONFIG.verdict_type;
+  setProgress(100);
+
+  await sleep(3500);
+
+  // reset and loop
+  inputBody.querySelectorAll('.val').forEach(el => el.textContent = '');
+  outputBody.querySelectorAll('.calc').forEach(el => el.textContent = '');
+  badge.classList.remove('show');
+  profitEl.textContent = '';
+  setProgress(0);
+  await sleep(1200);
+  run();
+}
+
+run();
+</script>
+</body>
+</html>
