@@ -1130,18 +1130,30 @@ def scrape_status(job_id: str):
 # /post_social  — post video to social platforms via PostForMe
 # ---------------------------------------------------------------------------
 
-POSTFORME_KEY = os.environ.get("POSTFORME_API_KEY", "pfm_live_NKkQ1qHJvcuWFCudHFJvEn")
+POSTFORME_KEY     = os.environ.get("POSTFORME_API_KEY",    "pfm_live_NKkQ1qHJvcuWFCudHFJvEn")
 POSTFORME_PROJECT = os.environ.get("POSTFORME_PROJECT_ID", "proj_aQKJvY2qoTLqrAxdDgO")
+POSTFORME_URL     = "https://api.postforme.dev/social-posts"
+
+# Social account IDs from PostForMe dashboard (spc_ = social provider connection)
+POSTFORME_ACCOUNTS = {
+    "tiktok":    "spc_tTTlWEQ69lhuKzbhMl",
+    "instagram": "spc_I7hsLcx2u06vJHMKnWci",
+    "youtube":   "spc_gQafffIHcAwOUUoZs9n6a",
+    "facebook":  "spc_WwGB1zDY5lSwJ7B7sdOY",
+    "bluesky":   "spc_EgYbrux05jbgLu1uhUHe6",
+}
 
 class PostSocialRequest(BaseModel):
     tiktok_url: str | None = None
     instagram_url: str | None = None
     youtube_url: str | None = None
     facebook_url: str | None = None
+    bluesky_url: str | None = None
     tiktok_caption: str = ""
     instagram_caption: str = ""
     youtube_caption: str = ""
     facebook_caption: str = ""
+    bluesky_caption: str = ""
     schedule_at: str | None = None  # ISO8601 — None = post immediately
 
 
@@ -1160,6 +1172,7 @@ def post_social(req: PostSocialRequest):
         "instagram": (req.instagram_url, req.instagram_caption),
         "youtube":   (req.youtube_url,   req.youtube_caption),
         "facebook":  (req.facebook_url,  req.facebook_caption),
+        "bluesky":   (req.bluesky_url,   req.bluesky_caption),
     }
 
     results = {}
@@ -1167,20 +1180,20 @@ def post_social(req: PostSocialRequest):
         if not video_url:
             continue
         payload = {
-            "project_id": POSTFORME_PROJECT,
-            "platform": platform,
-            "video_url": video_url,
             "caption": caption,
+            "social_accounts": [POSTFORME_ACCOUNTS[platform]],
+            "media": [{"url": video_url}],
         }
         if req.schedule_at:
             payload["scheduled_at"] = req.schedule_at
-        else:
-            payload["publish_now"] = True
 
         try:
-            r = _req.post("https://api.postfor.me/v1/posts",
-                          json=payload, headers=headers, timeout=30)
-            results[platform] = {"status": r.status_code, "body": r.json()}
+            r = _req.post(POSTFORME_URL, json=payload, headers=headers, timeout=30)
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text
+            results[platform] = {"status": r.status_code, "body": body}
         except Exception as e:
             results[platform] = {"status": "error", "error": str(e)}
 
