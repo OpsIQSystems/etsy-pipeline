@@ -1339,6 +1339,10 @@ _yt_state: dict  = {}
 _YT_TOKEN_FILE   = BASE / "yt_token.json"
 _yt_token_cache: dict = {}  # in-memory; seeded from env var or file at startup
 
+# Facebook — Page token from PostForMe (expires 2026-08-29)
+FB_PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
+FB_PAGE_ID    = os.environ.get("FB_PAGE_ID", "")   # numeric page ID
+
 
 def _yt_load_token() -> dict:
     if _yt_token_cache:
@@ -1709,10 +1713,25 @@ def engage_comments(req: EngageCommentsRequest):
                 _last_video_post["last_engaged_at"] = _time.time()
 
     # ── Facebook ───────────────────────────────────────────────────────────
-    if req.fb_post_id and req.fb_page_token:
+    fb_token = req.fb_page_token or FB_PAGE_TOKEN
+    fb_page  = FB_PAGE_ID
+
+    # Auto-detect latest Facebook post if no post_id supplied
+    fb_post_id = req.fb_post_id
+    if not fb_post_id and fb_token and fb_page:
+        feed = _req.get(
+            f"https://graph.facebook.com/v19.0/{fb_page}/posts",
+            params={"access_token": fb_token, "limit": 1, "fields": "id"},
+            timeout=15,
+        ).json()
+        items = feed.get("data", [])
+        if items:
+            fb_post_id = items[0]["id"]
+
+    if fb_post_id and fb_token:
         fb_resp = _req.get(
-            f"https://graph.facebook.com/v19.0/{req.fb_post_id}/comments",
-            params={"access_token": req.fb_page_token, "fields": "id,from,message,comments{from,message}", "limit": req.max_comments},
+            f"https://graph.facebook.com/v19.0/{fb_post_id}/comments",
+            params={"access_token": fb_token, "fields": "id,from,message,comments{from,message}", "limit": req.max_comments},
             timeout=15,
         ).json()
 
@@ -1739,7 +1758,7 @@ def engage_comments(req: EngageCommentsRequest):
 
             post_r = _req.post(
                 f"https://graph.facebook.com/v19.0/{cid}/comments",
-                params={"access_token": req.fb_page_token},
+                params={"access_token": fb_token},
                 json={"message": reply_text},
                 timeout=20,
             )
@@ -1753,8 +1772,6 @@ def engage_comments(req: EngageCommentsRequest):
                 })
             else:
                 results["errors"].append(f"Facebook reply failed for {cid}: {post_r.text[:200]}")
-    elif req.fb_post_id:
-        results["errors"].append("fb_page_token required to engage Facebook comments")
 
     return results
 
