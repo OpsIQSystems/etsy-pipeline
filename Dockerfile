@@ -22,4 +22,4 @@ ENV FONT_PATH=/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf
 
 EXPOSE 8000
 
-CMD ["/bin/sh", "-c", "python -c 'import moviepy; import edge_tts; import PIL; import aiofiles; print(\"ALL DEPS OK\")' && uvicorn api_server:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["/bin/sh", "-c", "uvicorn api_server:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
