@@ -220,7 +220,7 @@ PLATFORM_SPECS = {
 ALL_PLATFORMS = list(PLATFORM_SPECS.keys())
 
 
-def _format_caption(raw: str, platform: str, etsy_url: str = "https://searchopsiq.etsy.com") -> str:
+def _format_caption(raw: str, platform: str, etsy_url: str = "https://opsiqsystems.etsy.com") -> str:
     """Build a platform-safe caption: disclosure prefix + body + CTA, hashtags capped."""
     import re
     spec = PLATFORM_SPECS.get(platform, {})
@@ -942,7 +942,7 @@ def _render_video_sync(req: "RenderVideoRequest"):
         try:
             from moviepy import TextClip
             cta_start = max(0, max_dur - 3.0)
-            shop_url = req.product_url or "https://searchopsiq.etsy.com"
+            shop_url = req.product_url or "https://opsiqsystems.etsy.com"
             if req.product_name:
                 cta_text = f"Get it now ↓\n{req.product_name}\n{shop_url}"
             else:
@@ -1170,7 +1170,7 @@ class PostSocialRequest(BaseModel):
     facebook_caption: str = ""
     bluesky_caption: str = ""
     schedule_at: str | None = None  # ISO8601 — None = post immediately
-    etsy_url: str = "https://searchopsiq.etsy.com"
+    etsy_url: str = "https://opsiqsystems.etsy.com"
 
 
 @app.post("/post_social")
@@ -1483,7 +1483,7 @@ def youtube_token_export():
 
 class AddYouTubeCardRequest(BaseModel):
     video_id: str
-    etsy_url: str = "https://searchopsiq.etsy.com"
+    etsy_url: str = "https://opsiqsystems.etsy.com"
     product_name: str | None = None
 
 
