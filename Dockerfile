@@ -22,4 +22,4 @@ ENV FONT_PATH=/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf
 
 EXPOSE 8000
 
-CMD ["/bin/sh", "-c", "uvicorn api_server:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+CMD ["uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
