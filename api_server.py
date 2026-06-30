@@ -1224,6 +1224,90 @@ def pfm_accounts():
     return results
 
 
+# ---------------------------------------------------------------------------
+# Etsy OAuth 2.0 PKCE flow
+# ---------------------------------------------------------------------------
+
+ETSY_CLIENT_ID   = os.environ.get("ETSY_API_KEY", "cryqes5091axunk5gis4cy0u")
+ETSY_REDIRECT    = f"https://{PUBLIC_BASE}/etsy_callback"
+ETSY_SCOPES      = "listings_r listings_w shops_r shops_w transactions_r"
+_etsy_pkce: dict = {}   # stores code_verifier between /etsy_auth and /etsy_callback
+
+@app.get("/etsy_auth")
+def etsy_auth():
+    """Generate PKCE challenge and return the Etsy authorization URL."""
+    import hashlib, base64, secrets
+    verifier  = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    _etsy_pkce["verifier"] = verifier
+    _etsy_pkce["state"]    = state
+    url = (
+        "https://www.etsy.com/oauth/connect"
+        f"?response_type=code"
+        f"&redirect_uri={ETSY_REDIRECT}"
+        f"&scope={ETSY_SCOPES.replace(' ', '%20')}"
+        f"&client_id={ETSY_CLIENT_ID}"
+        f"&state={state}"
+        f"&code_challenge={challenge}"
+        f"&code_challenge_method=S256"
+    )
+    return {"auth_url": url, "state": state}
+
+
+@app.get("/etsy_callback")
+def etsy_callback(code: str = "", state: str = "", error: str = ""):
+    """Receive Etsy OAuth callback, exchange code for token, and store it."""
+    import requests as _req
+    if error:
+        return {"status": "error", "error": error}
+    if state != _etsy_pkce.get("state"):
+        return {"status": "error", "error": "state mismatch"}
+
+    token_resp = _req.post(
+        "https://api.etsy.com/v3/public/oauth/token",
+        data={
+            "grant_type":    "authorization_code",
+            "client_id":     ETSY_CLIENT_ID,
+            "redirect_uri":  ETSY_REDIRECT,
+            "code":          code,
+            "code_verifier": _etsy_pkce.get("verifier", ""),
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    if token_resp.status_code != 200:
+        return {"status": "error", "code": token_resp.status_code, "body": token_resp.text}
+
+    token_data = token_resp.json()
+    access_token  = token_data.get("access_token", "")
+    refresh_token = token_data.get("refresh_token", "")
+
+    # Persist to a local file so it survives restarts
+    token_file = BASE / "etsy_token.json"
+    token_file.write_text(
+        json.dumps({"access_token": access_token, "refresh_token": refresh_token}, indent=2)
+    )
+
+    return {
+        "status": "ok",
+        "message": "Etsy OAuth complete — token saved. You can close this tab.",
+        "access_token_preview": access_token[:12] + "...",
+    }
+
+
+@app.get("/etsy_token_status")
+def etsy_token_status():
+    """Check whether we have a valid Etsy access token stored."""
+    token_file = BASE / "etsy_token.json"
+    if not token_file.exists():
+        return {"has_token": False}
+    data = json.loads(token_file.read_text())
+    return {"has_token": bool(data.get("access_token")), "preview": data.get("access_token", "")[:12] + "..."}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
