@@ -15,6 +15,16 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+# Fail loudly at startup if heavy deps are broken (not silently after deploy)
+try:
+    import moviepy  # noqa: F401
+    import edge_tts  # noqa: F401
+    import PIL  # noqa: F401
+    print("✓ Core deps loaded: moviepy, edge_tts, PIL")
+except ImportError as _e:
+    print(f"✗ STARTUP IMPORT ERROR: {_e}")
+    raise
+
 app = FastAPI(title="Etsy Pipeline API", version="1.0.0")
 
 BASE        = Path(__file__).parent
