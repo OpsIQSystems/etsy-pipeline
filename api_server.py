@@ -593,10 +593,13 @@ def _download_clip(url: str, dest: Path) -> bool:
 
 
 def _flash_cut_broll(clip_paths: list[Path], total_dur: float, spec: dict):
-    """Stack B-roll clips in fast cuts to fill total_dur seconds, fitted to platform spec."""
+    """Stack B-roll clips in fast cuts to fill total_dur seconds, fitted to platform spec.
+    Returns (composed_clip, source_clips_to_close_after_render).
+    Caller MUST close source_clips after write_videofile completes.
+    """
     from moviepy import VideoFileClip, concatenate_videoclips, ColorClip
     segments = []
-    source_clips = []  # keep refs alive until after concatenation
+    source_clips = []
     remaining = total_dur
     idx = 0
     while remaining > 0.5 and idx < len(clip_paths) * 3:
@@ -612,18 +615,14 @@ def _flash_cut_broll(clip_paths: list[Path], total_dur: float, spec: dict):
             seg = _fit_video_to_platform(clip.subclipped(start, start + cut_len), spec)
             seg = seg.without_audio()
             segments.append(seg)
-            source_clips.append(clip)  # keep open until concatenation is done
+            source_clips.append(clip)
             remaining -= cut_len
         except Exception:
             pass
         idx += 1
     if not segments:
-        return ColorClip(size=(spec["w"], spec["h"]), color=(0, 0, 0)).with_duration(total_dur)
-    result = concatenate_videoclips(segments, method="compose")
-    for c in source_clips:
-        try: c.close()
-        except Exception: pass
-    return result
+        return ColorClip(size=(spec["w"], spec["h"]), color=(0, 0, 0)).with_duration(total_dur), []
+    return concatenate_videoclips(segments, method="compose"), source_clips
 
 
 class RenderVideoRequest(BaseModel):
@@ -741,8 +740,8 @@ def _render_video_sync(req: "RenderVideoRequest"):
         spec = PLATFORM_SPECS[platform]
         max_dur = min(total_dur, spec["max_sec"])
 
-        # 3. Flash-cut composite
-        broll = _flash_cut_broll(clip_paths, max_dur, spec)
+        # 3. Flash-cut composite — source clips must stay open until after write_videofile
+        broll, broll_sources = _flash_cut_broll(clip_paths, max_dur, spec)
         broll = broll.with_duration(max_dur)
 
         # 4. Audio
@@ -806,7 +805,11 @@ def _render_video_sync(req: "RenderVideoRequest"):
         out_path = audio_dir / f"{uid}_{platform}.mp4"
         final.write_videofile(str(out_path), codec="libx264", audio_codec="aac",
                               fps=spec["fps"], logger=None, threads=2)
+        # Close AFTER write_videofile so lazy readers can still access source frames
         final.close()
+        for c in broll_sources:
+            try: c.close()
+            except Exception: pass
         urls[platform] = f"https://{PUBLIC_BASE}/media/{out_path.name}"
         captions[platform] = _format_caption(req.script[:500], platform)
 
