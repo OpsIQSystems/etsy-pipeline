@@ -68,43 +68,88 @@ def _get_reddit_token() -> str:
 
 
 def scrape_reddit(subreddits: list[str] | None = None, limit: int = 25, sort: str = "hot") -> list[dict]:
-    """Fetch top posts from trade subreddits via Reddit OAuth2 API."""
+    """
+    Fetch top posts from trade subreddits.
+    Prefers OAuth2 API if creds set; falls back to Playwright (real browser).
+    """
     subs = subreddits or TRADE_SUBREDDITS
-    results = []
 
+    # Try OAuth2 first (fastest, if creds are configured)
     token = _get_reddit_token()
     if token:
-        base_url = "https://oauth.reddit.com"
+        results = []
         headers = {"Authorization": f"bearer {token}", "User-Agent": _REDDIT_UA}
-    else:
-        # Fallback: try old.reddit.com (sometimes works without auth)
-        base_url = "https://old.reddit.com"
-        headers = {"User-Agent": _REDDIT_UA}
+        for sub in subs:
+            url = f"https://oauth.reddit.com/r/{sub}/{sort}.json?limit={limit}&raw_json=1"
+            try:
+                r = requests.get(url, headers=headers, timeout=15)
+                if r.status_code == 200:
+                    for p in r.json().get("data", {}).get("children", []):
+                        d = p.get("data", {})
+                        results.append({
+                            "source": "reddit",
+                            "subreddit": sub,
+                            "title": d.get("title", ""),
+                            "score": d.get("score", 0),
+                            "comments": d.get("num_comments", 0),
+                            "upvote_ratio": d.get("upvote_ratio", 0),
+                            "flair": d.get("link_flair_text", ""),
+                            "text": d.get("selftext", "")[:500],
+                            "url": f"https://reddit.com{d.get('permalink', '')}",
+                            "created_utc": d.get("created_utc", 0),
+                        })
+                time.sleep(random.uniform(0.3, 0.8))
+            except Exception as e:
+                print(f"[reddit] r/{sub}: {e}")
+        return results
 
-    for sub in subs:
-        url = f"{base_url}/r/{sub}/{sort}.json?limit={limit}&raw_json=1"
-        try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 200:
-                for p in r.json().get("data", {}).get("children", []):
-                    d = p.get("data", {})
-                    results.append({
-                        "source": "reddit",
-                        "subreddit": sub,
-                        "title": d.get("title", ""),
-                        "score": d.get("score", 0),
-                        "comments": d.get("num_comments", 0),
-                        "upvote_ratio": d.get("upvote_ratio", 0),
-                        "flair": d.get("link_flair_text", ""),
-                        "text": d.get("selftext", "")[:500],
-                        "url": f"https://reddit.com{d.get('permalink', '')}",
-                        "created_utc": d.get("created_utc", 0),
-                    })
-            else:
-                print(f"[reddit] r/{sub}: HTTP {r.status_code}")
-            time.sleep(random.uniform(0.3, 0.8))
-        except Exception as e:
-            print(f"[reddit] r/{sub}: {e}")
+    # Fallback: Playwright real browser (no credentials needed)
+    return _scrape_reddit_playwright(subs, limit, sort)
+
+
+def _scrape_reddit_playwright(subs: list[str], limit: int, sort: str) -> list[dict]:
+    """Scrape Reddit using a real Playwright browser — bypasses API auth requirement."""
+    from playwright.sync_api import sync_playwright
+    import json as _json
+
+    results = []
+    with sync_playwright() as p:
+        browser, ctx = _new_browser_context(p)
+        page = ctx.new_page()
+        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+
+        for sub in subs:
+            url = f"https://www.reddit.com/r/{sub}/{sort}.json?limit={limit}&raw_json=1"
+            try:
+                # Use route to fetch JSON directly (avoids HTML rendering overhead)
+                response = page.request.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0 Safari/537.36"}
+                )
+                if response.status == 200:
+                    data = response.json()
+                    for p_item in data.get("data", {}).get("children", []):
+                        d = p_item.get("data", {})
+                        results.append({
+                            "source": "reddit",
+                            "subreddit": sub,
+                            "title": d.get("title", ""),
+                            "score": d.get("score", 0),
+                            "comments": d.get("num_comments", 0),
+                            "upvote_ratio": d.get("upvote_ratio", 0),
+                            "flair": d.get("link_flair_text", ""),
+                            "text": d.get("selftext", "")[:500],
+                            "url": f"https://reddit.com{d.get('permalink', '')}",
+                            "created_utc": d.get("created_utc", 0),
+                        })
+                    print(f"[reddit] r/{sub}: {len(data.get('data',{}).get('children',[]))} posts")
+                else:
+                    print(f"[reddit] r/{sub}: HTTP {response.status}")
+                time.sleep(random.uniform(0.5, 1.0))
+            except Exception as e:
+                print(f"[reddit] r/{sub}: {e}")
+
+        browser.close()
     return results
 
 
