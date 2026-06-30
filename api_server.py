@@ -65,17 +65,30 @@ def health():
     return {"status": "ok", "cwd": str(BASE)}
 
 
+@app.get("/day_type")
+def day_type():
+    """
+    Returns whether today is a product day (use queue) or humor day (render fresh).
+    Even day-of-year = product, Odd = humor.
+    """
+    import datetime
+    today = datetime.date.today()
+    day_num = today.timetuple().tm_yday  # 1-366
+    dtype = "humor" if day_num % 2 == 1 else "product"
+    return {"date": today.isoformat(), "day_number": day_num, "type": dtype}
+
+
 @app.get("/queue_today")
 def queue_today():
     """
-    Returns today's pre-rendered video URLs from products/uploads/.
-    The workflow checks this first — if videos exist, skip render and post directly.
+    Returns today's pre-rendered PRODUCT video URLs from products/uploads/.
+    Skips humor entries — those slots are filled by fresh renders on humor days.
     Files are named: YYYY-MM-DD_HHMM_<type>_<title>.mp4
     """
     import datetime
-    today = datetime.date.today().isoformat()  # e.g. "2026-07-01"
+    today = datetime.date.today().isoformat()
 
-    result = {"date": today, "found": False, "video_type": None, "urls": {}}
+    result = {"date": today, "found": False, "video_type": "product", "urls": {}}
 
     for platform in ("tiktok", "instagram", "youtube", "facebook"):
         platform_dir = _uploads_dir / platform
@@ -83,15 +96,15 @@ def queue_today():
             continue
         for f in sorted(platform_dir.iterdir()):
             if f.name.startswith(today) and f.suffix == ".mp4":
-                # Extract video_type from filename: YYYY-MM-DD_HHMM_<type>_...
                 parts = f.stem.split("_")
-                if len(parts) >= 3:
-                    result["video_type"] = parts[2]  # "humor" or "product"
+                vtype = parts[2] if len(parts) >= 3 else "product"
+                if vtype == "humor":
+                    break  # humor days handled by render pipeline
+                result["video_type"] = vtype
                 result["urls"][platform] = f"https://{PUBLIC_BASE}/queue/{platform}/{f.name}"
                 result["found"] = True
                 break
 
-    # TikTok video works for YouTube and Facebook if dedicated files don't exist
     tiktok_url = result["urls"].get("tiktok")
     if tiktok_url:
         result["urls"].setdefault("youtube", tiktok_url)
