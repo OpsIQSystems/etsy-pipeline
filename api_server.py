@@ -29,6 +29,14 @@ try:
     app.mount("/media", StaticFiles(directory=str(_media_dir)), name="media")
 except Exception as _e:
     print(f"WARNING: could not mount /media StaticFiles: {_e}")
+
+# Serve pre-rendered video queue publicly
+_uploads_dir = BASE / "products" / "uploads"
+_uploads_dir.mkdir(parents=True, exist_ok=True)
+try:
+    app.mount("/queue", StaticFiles(directory=str(_uploads_dir)), name="queue")
+except Exception as _e:
+    print(f"WARNING: could not mount /queue StaticFiles: {_e}")
 FONT = os.environ.get("FONT_PATH", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf")
 
 
@@ -55,6 +63,42 @@ class TTSRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok", "cwd": str(BASE)}
+
+
+@app.get("/queue_today")
+def queue_today():
+    """
+    Returns today's pre-rendered video URLs from products/uploads/.
+    The workflow checks this first — if videos exist, skip render and post directly.
+    Files are named: YYYY-MM-DD_HHMM_<type>_<title>.mp4
+    """
+    import datetime
+    today = datetime.date.today().isoformat()  # e.g. "2026-07-01"
+
+    result = {"date": today, "found": False, "video_type": None, "urls": {}}
+
+    for platform in ("tiktok", "instagram", "youtube", "facebook"):
+        platform_dir = _uploads_dir / platform
+        if not platform_dir.exists():
+            continue
+        for f in sorted(platform_dir.iterdir()):
+            if f.name.startswith(today) and f.suffix == ".mp4":
+                # Extract video_type from filename: YYYY-MM-DD_HHMM_<type>_...
+                parts = f.stem.split("_")
+                if len(parts) >= 3:
+                    result["video_type"] = parts[2]  # "humor" or "product"
+                result["urls"][platform] = f"https://{PUBLIC_BASE}/queue/{platform}/{f.name}"
+                result["found"] = True
+                break
+
+    # TikTok video works for YouTube and Facebook if dedicated files don't exist
+    tiktok_url = result["urls"].get("tiktok")
+    if tiktok_url:
+        result["urls"].setdefault("youtube", tiktok_url)
+        result["urls"].setdefault("facebook", tiktok_url)
+        result["urls"].setdefault("instagram", tiktok_url)
+
+    return result
 
 
 @app.post("/build")
