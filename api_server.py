@@ -1506,6 +1506,11 @@ def add_youtube_card(req: AddYouTubeCardRequest):
         timeout=15,
     )
 
+    # Record post time for engagement throttling
+    import time as _time
+    _last_video_post.clear()
+    _last_video_post.update({"video_id": video_id, "posted_at": _time.time(), "last_engaged_at": None})
+
     return {"status": "ok", "video_id": video_id, "comment_id": comment_id, "comment": body}
 
 
@@ -1516,6 +1521,41 @@ def add_youtube_card(req: AddYouTubeCardRequest):
 # Stored in memory — resets on redeploy, but the YouTube API check (has_owner_reply)
 # prevents duplicate replies even after a restart.
 _replied_yt_ids: set[str] = set()
+
+# Tracks the last posted video and when it was posted, set by /add_youtube_card
+_last_video_post: dict = {}   # {"video_id": str, "posted_at": float, "last_engaged_at": float | None}
+
+def _should_engage(video_id: str) -> tuple[bool, str]:
+    """
+    Engagement schedule based on video age:
+      - Days 0-3:  12x/day  (every 2h)
+      - Days 4-17: 1x/day   (every 24h)
+      - Day 18+:   1x/week  (every 7 days)
+    Returns (should_run, reason).
+    """
+    import time
+    info = _last_video_post
+    if not info or info.get("video_id") != video_id:
+        return True, "no schedule data — running"
+
+    now = time.time()
+    age_days = (now - info["posted_at"]) / 86400
+    last = info.get("last_engaged_at")
+
+    if age_days <= 3:
+        interval = 7200       # 2 hours
+        label = "12x/day window"
+    elif age_days <= 17:
+        interval = 86400      # 24 hours
+        label = "1x/day window"
+    else:
+        interval = 604800     # 7 days
+        label = "1x/week window"
+
+    if last is None or (now - last) >= interval:
+        return True, label
+    wait_min = int((interval - (now - last)) / 60)
+    return False, f"throttled ({label}) — next run in {wait_min}min"
 
 ENGAGE_SYSTEM_PROMPT = """You reply to comments on Unit Unhinged social videos.
 Unit Unhinged sells AI-powered business tools for contractors, landlords, and real-estate investors on Etsy.
@@ -1574,6 +1614,7 @@ def engage_comments(req: EngageCommentsRequest):
     """
     import requests as _req
 
+    import time as _time
     results = {"youtube": [], "facebook": [], "errors": []}
 
     # ── YouTube ────────────────────────────────────────────────────────────
@@ -1605,6 +1646,10 @@ def engage_comments(req: EngageCommentsRequest):
                 video_id = items[0]["id"]["videoId"]
 
         if video_id:
+            ok, reason = _should_engage(video_id)
+            if not ok:
+                return {"status": "throttled", "reason": reason, "youtube": [], "facebook": [], "errors": []}
+
             threads_resp = _req.get(
                 "https://www.googleapis.com/youtube/v3/commentThreads",
                 params={
@@ -1658,6 +1703,10 @@ def engage_comments(req: EngageCommentsRequest):
                     })
                 else:
                     results["errors"].append(f"YouTube reply failed for {thread_id}: {post_r.text[:200]}")
+
+            # Stamp last engaged time
+            if _last_video_post.get("video_id") == video_id:
+                _last_video_post["last_engaged_at"] = _time.time()
 
     # ── Facebook ───────────────────────────────────────────────────────────
     if req.fb_post_id and req.fb_page_token:
