@@ -596,32 +596,34 @@ def _flash_cut_broll(clip_paths: list[Path], total_dur: float, spec: dict):
     """Stack B-roll clips in fast cuts to fill total_dur seconds, fitted to platform spec."""
     from moviepy import VideoFileClip, concatenate_videoclips, ColorClip
     segments = []
+    source_clips = []  # keep refs alive until after concatenation
     remaining = total_dur
     idx = 0
     while remaining > 0.5 and idx < len(clip_paths) * 3:
         src = clip_paths[idx % len(clip_paths)]
         try:
             clip = VideoFileClip(str(src))
-            # each cut: 2–4 seconds
             cut_len = min(clip.duration, min(remaining, 3.5))
             if cut_len < 0.5:
                 clip.close()
                 idx += 1
                 continue
-            # start midway through clip to avoid intros
             start = max(0, (clip.duration - cut_len) / 2)
             seg = _fit_video_to_platform(clip.subclipped(start, start + cut_len), spec)
             seg = seg.without_audio()
             segments.append(seg)
+            source_clips.append(clip)  # keep open until concatenation is done
             remaining -= cut_len
-            clip.close()
         except Exception:
             pass
         idx += 1
     if not segments:
-        # fallback: black canvas
         return ColorClip(size=(spec["w"], spec["h"]), color=(0, 0, 0)).with_duration(total_dur)
-    return concatenate_videoclips(segments, method="compose")
+    result = concatenate_videoclips(segments, method="compose")
+    for c in source_clips:
+        try: c.close()
+        except Exception: pass
+    return result
 
 
 class RenderVideoRequest(BaseModel):
