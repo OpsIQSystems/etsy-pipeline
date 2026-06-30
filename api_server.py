@@ -220,7 +220,7 @@ PLATFORM_SPECS = {
 ALL_PLATFORMS = list(PLATFORM_SPECS.keys())
 
 
-def _format_caption(raw: str, platform: str, etsy_url: str = "searchopsiq.etsy.com") -> str:
+def _format_caption(raw: str, platform: str, etsy_url: str = "https://searchopsiq.etsy.com") -> str:
     """Build a platform-safe caption: disclosure prefix + body + CTA, hashtags capped."""
     import re
     spec = PLATFORM_SPECS.get(platform, {})
@@ -942,7 +942,7 @@ def _render_video_sync(req: "RenderVideoRequest"):
         try:
             from moviepy import TextClip
             cta_start = max(0, max_dur - 3.0)
-            shop_url = req.product_url or "searchopsiq.etsy.com"
+            shop_url = req.product_url or "https://searchopsiq.etsy.com"
             if req.product_name:
                 cta_text = f"Get: {req.product_name}\nLink in bio  •  {shop_url}"
             else:
