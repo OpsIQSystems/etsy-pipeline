@@ -25,8 +25,11 @@ PUBLIC_BASE = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "etsy-pipeline-production.
 # Serve rendered videos publicly so PostForMe can download them
 _media_dir = BASE / "products" / "audio"
 _media_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/media", StaticFiles(directory=str(_media_dir)), name="media")
-FONT   = os.environ.get("FONT_PATH", r"C:\Windows\Fonts\arialbd.ttf")
+try:
+    app.mount("/media", StaticFiles(directory=str(_media_dir)), name="media")
+except Exception as _e:
+    print(f"WARNING: could not mount /media StaticFiles: {_e}")
+FONT = os.environ.get("FONT_PATH", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf")
 
 
 class BuildRequest(BaseModel):
