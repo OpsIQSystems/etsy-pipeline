@@ -1378,15 +1378,29 @@ YT_REDIRECT      = f"https://{PUBLIC_BASE}/youtube_callback"
 YT_SCOPES        = "https://www.googleapis.com/auth/youtube.force-ssl"
 _yt_state: dict  = {}
 _YT_TOKEN_FILE   = BASE / "yt_token.json"
+_yt_token_cache: dict = {}  # in-memory; seeded from env var or file at startup
 
 
 def _yt_load_token() -> dict:
+    if _yt_token_cache:
+        return dict(_yt_token_cache)
     if _YT_TOKEN_FILE.exists():
-        return json.loads(_YT_TOKEN_FILE.read_text())
+        data = json.loads(_YT_TOKEN_FILE.read_text())
+        _yt_token_cache.update(data)
+        return data
+    # Fall back to env var (set this in Railway after first auth)
+    raw = os.environ.get("YT_TOKEN_JSON", "")
+    if raw:
+        data = json.loads(raw)
+        _yt_token_cache.update(data)
+        _YT_TOKEN_FILE.write_text(json.dumps(data, indent=2))
+        return data
     return {}
 
 
 def _yt_save_token(data: dict):
+    _yt_token_cache.clear()
+    _yt_token_cache.update(data)
     _YT_TOKEN_FILE.write_text(json.dumps(data, indent=2))
 
 
@@ -1457,6 +1471,15 @@ def youtube_callback(code: str = "", state: str = "", error: str = ""):
 def youtube_auth_status():
     token = _yt_load_token()
     return {"has_token": bool(token.get("access_token"))}
+
+
+@app.get("/youtube_token_export")
+def youtube_token_export():
+    """Return the raw token JSON — paste this as YT_TOKEN_JSON env var in Railway."""
+    token = _yt_load_token()
+    if not token:
+        return {"error": "No token. Complete /youtube_auth first."}
+    return {"YT_TOKEN_JSON": json.dumps(token)}
 
 
 class AddYouTubeCardRequest(BaseModel):
