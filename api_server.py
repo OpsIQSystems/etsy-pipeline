@@ -1323,6 +1323,149 @@ def etsy_token_status():
     return {"has_token": bool(data.get("access_token")), "preview": data.get("access_token", "")[:12] + "..."}
 
 
+# ---------------------------------------------------------------------------
+# YouTube OAuth 2.0 + Data API — post & pin comment after each video upload
+# ---------------------------------------------------------------------------
+
+YT_CLIENT_ID     = os.environ.get("YT_CLIENT_ID", "")
+YT_CLIENT_SECRET = os.environ.get("YT_CLIENT_SECRET", "")
+YT_REDIRECT      = f"https://{PUBLIC_BASE}/youtube_callback"
+YT_SCOPES        = "https://www.googleapis.com/auth/youtube.force-ssl"
+_yt_state: dict  = {}
+_YT_TOKEN_FILE   = BASE / "yt_token.json"
+
+
+def _yt_load_token() -> dict:
+    if _YT_TOKEN_FILE.exists():
+        return json.loads(_YT_TOKEN_FILE.read_text())
+    return {}
+
+
+def _yt_save_token(data: dict):
+    _YT_TOKEN_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _yt_refresh_if_needed(token: dict) -> dict:
+    import requests as _req, time
+    if not token.get("refresh_token"):
+        return token
+    expires_at = token.get("expires_at", 0)
+    if time.time() < expires_at - 60:
+        return token
+    r = _req.post("https://oauth2.googleapis.com/token", data={
+        "client_id":     YT_CLIENT_ID,
+        "client_secret": YT_CLIENT_SECRET,
+        "refresh_token": token["refresh_token"],
+        "grant_type":    "refresh_token",
+    }, timeout=15)
+    if r.ok:
+        new = r.json()
+        token["access_token"] = new["access_token"]
+        token["expires_at"]   = time.time() + new.get("expires_in", 3600)
+        _yt_save_token(token)
+    return token
+
+
+@app.get("/youtube_auth")
+def youtube_auth():
+    """Start YouTube OAuth — visit this URL in your browser to authorize."""
+    import secrets
+    state = secrets.token_urlsafe(16)
+    _yt_state["state"] = state
+    url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={YT_CLIENT_ID}"
+        f"&redirect_uri={YT_REDIRECT}"
+        f"&response_type=code"
+        f"&scope={YT_SCOPES}"
+        f"&access_type=offline"
+        f"&prompt=consent"
+        f"&state={state}"
+    )
+    return {"auth_url": url}
+
+
+@app.get("/youtube_callback")
+def youtube_callback(code: str = "", state: str = "", error: str = ""):
+    """Receive Google OAuth callback, exchange code for token, store it."""
+    import requests as _req, time
+    if error:
+        return {"status": "error", "error": error}
+    if state != _yt_state.get("state"):
+        return {"status": "error", "error": "state mismatch"}
+    r = _req.post("https://oauth2.googleapis.com/token", data={
+        "code":          code,
+        "client_id":     YT_CLIENT_ID,
+        "client_secret": YT_CLIENT_SECRET,
+        "redirect_uri":  YT_REDIRECT,
+        "grant_type":    "authorization_code",
+    }, timeout=15)
+    if not r.ok:
+        return {"status": "error", "body": r.text}
+    data = r.json()
+    data["expires_at"] = time.time() + data.get("expires_in", 3600)
+    _yt_save_token(data)
+    return {"status": "ok", "message": "YouTube authorized — token saved. You can close this tab."}
+
+
+@app.get("/youtube_auth_status")
+def youtube_auth_status():
+    token = _yt_load_token()
+    return {"has_token": bool(token.get("access_token"))}
+
+
+class AddYouTubeCardRequest(BaseModel):
+    video_id: str
+    etsy_url: str = "https://searchopsiq.etsy.com"
+    product_name: str | None = None
+
+
+@app.post("/add_youtube_card")
+def add_youtube_card(req: AddYouTubeCardRequest):
+    """
+    Post a comment with the Etsy link on a YouTube video via the Data API.
+    YouTube Shorts don't support cards — a pinned comment is the standard CTA method.
+    60-second delay built in so YouTube finishes processing the upload first.
+    """
+    import requests as _req, time
+    time.sleep(60)
+
+    token = _yt_load_token()
+    if not token.get("access_token"):
+        raise HTTPException(status_code=428, detail="No YouTube token. Visit /youtube_auth first.")
+    token = _yt_refresh_if_needed(token)
+
+    headers = {"Authorization": f"Bearer {token['access_token']}", "Content-Type": "application/json"}
+    body = f"🔗 Get it here → {req.etsy_url}" + (f"\n({req.product_name})" if req.product_name else "")
+
+    # Post the comment
+    r = _req.post(
+        "https://www.googleapis.com/youtube/v3/commentThreads?part=snippet",
+        headers=headers,
+        json={
+            "snippet": {
+                "videoId": req.video_id,
+                "topLevelComment": {"snippet": {"textOriginal": body}},
+            }
+        },
+        timeout=20,
+    )
+    if not r.ok:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+
+    comment_id = r.json()["id"]
+
+    # Pin the comment via YouTube Studio internal API
+    _req.post(
+        "https://studio.youtube.com/youtubei/v1/comment/pin",
+        headers={**headers, "x-goog-authuser": "0", "x-origin": "https://studio.youtube.com"},
+        json={"commentId": comment_id, "videoId": req.video_id},
+        timeout=15,
+    )
+
+    return {"status": "ok", "video_id": req.video_id, "comment_id": comment_id, "comment": body}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
