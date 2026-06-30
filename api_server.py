@@ -637,14 +637,46 @@ class RenderVideoRequest(BaseModel):
     broll_query: str | None = None     # override Pexels search term
 
 
+_jobs: dict = {}  # job_id → {"status": "pending"|"done"|"error", "result": ...}
+
+
+def _run_render_job(job_id: str, req: "RenderVideoRequest"):
+    """Runs in a background thread. Updates _jobs[job_id] when done."""
+    try:
+        result = _render_video_sync(req)
+        _jobs[job_id] = {"status": "done", "result": result}
+    except Exception as e:
+        _jobs[job_id] = {"status": "error", "error": str(e)}
+
+
+@app.get("/render_video/{job_id}")
+def render_video_status(job_id: str):
+    """Poll for render job completion."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
 @app.post("/render_video")
-def render_video(req: RenderVideoRequest):
+def render_video(req: RenderVideoRequest, background_tasks=None):
     """
     Flash-cut B-roll renderer. 3 video types:
       humor       — scraped trade humor, pure entertainment, no product mention
       ugc_product — first-person story: pain point → Etsy tool solved it
       ugc_casestudy — shows real numbers / simulated tool use with case study data
+    Starts render in background. Returns job_id. Poll GET /render_video/{job_id} for result.
     """
+    import uuid, threading
+    job_id = uuid.uuid4().hex
+    _jobs[job_id] = {"status": "pending"}
+    t = threading.Thread(target=_run_render_job, args=(job_id, req), daemon=True)
+    t.start()
+    return {"status": "pending", "job_id": job_id, "poll_url": f"https://{PUBLIC_BASE}/render_video/{job_id}"}
+
+
+def _render_video_sync(req: "RenderVideoRequest"):
+    """Actual render logic — runs in background thread."""
     import asyncio, uuid, requests, tempfile
     import edge_tts
     from moviepy import AudioFileClip, TextClip, CompositeVideoClip
