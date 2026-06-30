@@ -1441,9 +1441,10 @@ def youtube_token_export():
 
 
 class AddYouTubeCardRequest(BaseModel):
-    video_id: str
+    video_id: str | None = None          # auto-detects latest if omitted
     etsy_url: str = "https://opsiqsystems.etsy.com"
     product_name: str | None = None
+    video_type: str = "ugc_product"      # "humor" | "ugc_product" | "ugc_casestudy"
 
 
 @app.post("/add_youtube_card")
@@ -1451,10 +1452,14 @@ def add_youtube_card(req: AddYouTubeCardRequest):
     """
     Post a comment with the Etsy link on a YouTube video via the Data API.
     YouTube Shorts don't support cards — a pinned comment is the standard CTA method.
-    60-second delay built in so YouTube finishes processing the upload first.
+    Skips humor videos. Auto-detects latest video if video_id not provided.
+    90-second delay built in so YouTube finishes processing the upload first.
     """
+    if req.video_type == "humor":
+        return {"status": "skipped", "reason": "humor video — no CTA comment needed"}
+
     import requests as _req, time
-    time.sleep(60)
+    time.sleep(90)
 
     token = _yt_load_token()
     if not token.get("access_token"):
@@ -1464,13 +1469,25 @@ def add_youtube_card(req: AddYouTubeCardRequest):
     headers = {"Authorization": f"Bearer {token['access_token']}", "Content-Type": "application/json"}
     body = f"🔗 Get it here → {req.etsy_url}" + (f"\n({req.product_name})" if req.product_name else "")
 
+    video_id = req.video_id
+    if not video_id:
+        search = _req.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={"part": "snippet", "forMine": "true", "type": "video", "order": "date", "maxResults": 1},
+            headers=headers, timeout=15,
+        ).json()
+        items = search.get("items", [])
+        if not items:
+            raise HTTPException(status_code=404, detail="No videos found on channel")
+        video_id = items[0]["id"]["videoId"]
+
     # Post the comment
     r = _req.post(
         "https://www.googleapis.com/youtube/v3/commentThreads?part=snippet",
         headers=headers,
         json={
             "snippet": {
-                "videoId": req.video_id,
+                "videoId": video_id,
                 "topLevelComment": {"snippet": {"textOriginal": body}},
             }
         },
@@ -1485,11 +1502,11 @@ def add_youtube_card(req: AddYouTubeCardRequest):
     _req.post(
         "https://studio.youtube.com/youtubei/v1/comment/pin",
         headers={**headers, "x-goog-authuser": "0", "x-origin": "https://studio.youtube.com"},
-        json={"commentId": comment_id, "videoId": req.video_id},
+        json={"commentId": comment_id, "videoId": video_id},
         timeout=15,
     )
 
-    return {"status": "ok", "video_id": req.video_id, "comment_id": comment_id, "comment": body}
+    return {"status": "ok", "video_id": video_id, "comment_id": comment_id, "comment": body}
 
 
 if __name__ == "__main__":
