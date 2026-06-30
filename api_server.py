@@ -647,9 +647,7 @@ def render_video(req: RenderVideoRequest):
     """
     import asyncio, uuid, requests, tempfile
     import edge_tts
-    from moviepy import AudioFileClip, TextClip, CompositeVideoClip, ImageClip
-    from PIL import Image, ImageDraw, ImageFont
-    import numpy as np
+    from moviepy import AudioFileClip, TextClip, CompositeVideoClip
 
     uid = uuid.uuid4().hex
     audio_dir = BASE / "products" / "audio"
