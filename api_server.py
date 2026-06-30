@@ -524,6 +524,285 @@ def list_voices():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# /render_video  — 3-type B-roll flash-cut renderer with Pexels footage
+# ---------------------------------------------------------------------------
+
+PEXELS_KEY = os.environ.get("PEXELS_API_KEY", "")
+
+# Search terms per video type and trade — pulled from script keywords
+TRADE_BROLL_TERMS = {
+    "hvac": ["HVAC technician", "air conditioning repair", "hvac contractor"],
+    "plumbing": ["plumber working", "pipe installation", "plumbing repair"],
+    "electrical": ["electrician working", "electrical panel", "wiring installation"],
+    "roofing": ["roofer working", "roof installation", "roofing contractor"],
+    "construction": ["construction worker", "building contractor", "construction site"],
+    "default": ["contractor working", "tradesman job site", "construction crew"],
+}
+
+HUMOR_BROLL_TERMS = [
+    "construction worker funny moment",
+    "tradesman job site",
+    "contractor tools",
+    "plumber working",
+    "electrician working",
+    "roofer working",
+]
+
+
+def _pexels_fetch_videos(query: str, count: int = 4, orientation: str = "portrait") -> list[str]:
+    """Fetch up to `count` Pexels video download URLs for a search query."""
+    import requests
+    if not PEXELS_KEY:
+        return []
+    try:
+        r = requests.get(
+            "https://api.pexels.com/videos/search",
+            headers={"Authorization": PEXELS_KEY},
+            params={"query": query, "per_page": count * 2, "orientation": orientation, "size": "medium"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        videos = r.json().get("videos", [])
+        urls = []
+        for v in videos:
+            # prefer HD file, fall back to SD
+            files = sorted(v.get("video_files", []), key=lambda f: f.get("width", 0), reverse=True)
+            for f in files:
+                if f.get("link") and f.get("width", 0) >= 720:
+                    urls.append(f["link"])
+                    break
+            if len(urls) >= count:
+                break
+        return urls
+    except Exception:
+        return []
+
+
+def _download_clip(url: str, dest: Path) -> bool:
+    import requests
+    try:
+        r = requests.get(url, timeout=30, stream=True)
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+        return True
+    except Exception:
+        return False
+
+
+def _flash_cut_broll(clip_paths: list[Path], total_dur: float, spec: dict):
+    """Stack B-roll clips in fast cuts to fill total_dur seconds, fitted to platform spec."""
+    from moviepy import VideoFileClip, concatenate_videoclips, ColorClip
+    segments = []
+    remaining = total_dur
+    idx = 0
+    while remaining > 0.5 and idx < len(clip_paths) * 3:
+        src = clip_paths[idx % len(clip_paths)]
+        try:
+            clip = VideoFileClip(str(src))
+            # each cut: 2–4 seconds
+            cut_len = min(clip.duration, min(remaining, 3.5))
+            if cut_len < 0.5:
+                clip.close()
+                idx += 1
+                continue
+            # start midway through clip to avoid intros
+            start = max(0, (clip.duration - cut_len) / 2)
+            seg = _fit_video_to_platform(clip.subclipped(start, start + cut_len), spec)
+            seg = seg.without_audio()
+            segments.append(seg)
+            remaining -= cut_len
+            clip.close()
+        except Exception:
+            pass
+        idx += 1
+    if not segments:
+        # fallback: black canvas
+        return ColorClip(size=(spec["w"], spec["h"]), color=(0, 0, 0)).with_duration(total_dur)
+    return concatenate_videoclips(segments, method="compose")
+
+
+class RenderVideoRequest(BaseModel):
+    script: str
+    video_type: str = "humor"          # "humor" | "ugc_product" | "ugc_casestudy"
+    hook: str | None = None
+    persona_name: str | None = None
+    persona_trade: str | None = None
+    product_name: str | None = None
+    case_study_data: dict | None = None  # e.g. {"job_value": 14200, "profit": 2800}
+    voice: str = "en-US-GuyNeural"
+    platforms: list[str] = ALL_PLATFORMS
+    broll_query: str | None = None     # override Pexels search term
+
+
+@app.post("/render_video")
+def render_video(req: RenderVideoRequest):
+    """
+    Flash-cut B-roll renderer. 3 video types:
+      humor       — scraped trade humor, pure entertainment, no product mention
+      ugc_product — first-person story: pain point → Etsy tool solved it
+      ugc_casestudy — shows real numbers / simulated tool use with case study data
+    """
+    import asyncio, uuid, requests, tempfile
+    import edge_tts
+    from moviepy import AudioFileClip, TextClip, CompositeVideoClip, ImageClip
+    from PIL import Image, ImageDraw, ImageFont
+    import numpy as np
+
+    uid = uuid.uuid4().hex
+    audio_dir = BASE / "products" / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp())
+
+    # 1. TTS
+    audio_path = audio_dir / f"{uid}.mp3"
+
+    async def _tts():
+        await edge_tts.Communicate(req.script, req.voice).save(str(audio_path))
+
+    asyncio.run(_tts())
+    audio_master = AudioFileClip(str(audio_path))
+    total_dur = min(audio_master.duration, 58)  # cap at 58s for safety
+
+    # 2. Pexels B-roll search
+    if req.broll_query:
+        query = req.broll_query
+    elif req.video_type == "humor":
+        import random
+        query = random.choice(HUMOR_BROLL_TERMS)
+    else:
+        trade = (req.persona_trade or "").lower()
+        terms = next((v for k, v in TRADE_BROLL_TERMS.items() if k in trade), TRADE_BROLL_TERMS["default"])
+        query = terms[0]
+
+    clip_urls = _pexels_fetch_videos(query, count=6, orientation="portrait")
+
+    # fallback to landscape if portrait has no results
+    if not clip_urls:
+        clip_urls = _pexels_fetch_videos(query, count=6, orientation="landscape")
+
+    # fallback to local stock if Pexels returns nothing
+    if not clip_urls:
+        local_pool = (
+            sorted((BASE / "products" / "browser_demos").glob("browser_*.mp4")) +
+            sorted((BASE / "products" / "videos").glob("stick_*.mp4"))
+        )
+        clip_paths = local_pool[:6] if local_pool else []
+    else:
+        # download clips to tmp
+        clip_paths = []
+        for i, url in enumerate(clip_urls):
+            dest = tmp_dir / f"broll_{i}.mp4"
+            if _download_clip(url, dest):
+                clip_paths.append(dest)
+
+    if not clip_paths:
+        raise HTTPException(status_code=500, detail="No B-roll clips available (Pexels + local fallback both empty)")
+
+    platforms = [p for p in req.platforms if p in PLATFORM_SPECS] or ALL_PLATFORMS
+    urls = {}
+    captions = {}
+
+    for platform in platforms:
+        spec = PLATFORM_SPECS[platform]
+        max_dur = min(total_dur, spec["max_sec"])
+
+        # 3. Flash-cut composite
+        broll = _flash_cut_broll(clip_paths, max_dur, spec)
+        broll = broll.with_duration(max_dur)
+
+        # 4. Audio
+        aud = audio_master.subclipped(0, max_dur)
+        vid = broll.with_audio(aud)
+
+        # 5. Overlays
+        overlays = [vid]
+
+        # Hook text at top (first 3 seconds)
+        hook_text = req.hook or req.script[:80]
+        try:
+            hook_clip = (
+                TextClip(font=FONT, text=hook_text, font_size=38, color="white",
+                         stroke_color="black", stroke_width=3, method="caption",
+                         size=(spec["w"] - 60, None))
+                .with_position(("center", 0.08), relative=True)
+                .with_duration(min(3.5, max_dur))
+            )
+            overlays.append(hook_clip)
+        except Exception:
+            pass
+
+        # Persona name bar (bottom)
+        if req.persona_name and req.persona_trade:
+            label = f"{req.persona_name}  ·  {req.persona_trade}"
+            try:
+                name_clip = (
+                    TextClip(font=FONT, text=label, font_size=30, color="white",
+                             stroke_color="black", stroke_width=2, method="label")
+                    .with_position(("center", 0.88), relative=True)
+                    .with_duration(max_dur)
+                )
+                overlays.append(name_clip)
+            except Exception:
+                pass
+
+        # Case study data card (ugc_casestudy type — show at 3s)
+        if req.video_type == "ugc_casestudy" and req.case_study_data:
+            try:
+                lines = [f"{k.replace('_',' ').title()}: ${v:,}" if isinstance(v, (int, float))
+                         else f"{k.replace('_',' ').title()}: {v}"
+                         for k, v in req.case_study_data.items()]
+                card_text = "\n".join(lines)
+                card_start = min(3.0, max_dur * 0.3)
+                card_dur = min(4.0, max_dur - card_start)
+                if card_dur > 0.5:
+                    card_clip = (
+                        TextClip(font=FONT, text=card_text, font_size=34, color="#00FF88",
+                                 stroke_color="black", stroke_width=2, method="caption",
+                                 size=(spec["w"] - 80, None))
+                        .with_position(("center", 0.45), relative=True)
+                        .with_start(card_start)
+                        .with_duration(card_dur)
+                    )
+                    overlays.append(card_clip)
+            except Exception:
+                pass
+
+        final = CompositeVideoClip(overlays) if len(overlays) > 1 else vid
+        out_path = audio_dir / f"{uid}_{platform}.mp4"
+        final.write_videofile(str(out_path), codec="libx264", audio_codec="aac",
+                              fps=spec["fps"], logger=None, threads=2)
+        final.close()
+        urls[platform] = f"https://{PUBLIC_BASE}/media/{out_path.name}"
+        captions[platform] = _format_caption(req.script[:500], platform)
+
+    # cleanup
+    audio_path.unlink(missing_ok=True)
+    for p in tmp_dir.iterdir():
+        p.unlink(missing_ok=True)
+    tmp_dir.rmdir()
+
+    return {
+        "status": "ok",
+        "video_type": req.video_type,
+        "broll_query": query,
+        "urls": urls,
+        "tiktok_url":    urls.get("tiktok", ""),
+        "instagram_url": urls.get("instagram", ""),
+        "youtube_url":   urls.get("youtube", ""),
+        "facebook_url":  urls.get("facebook", ""),
+        "bluesky_url":   urls.get("bluesky", ""),
+        "captions": captions,
+        "tiktok_caption":    captions.get("tiktok", ""),
+        "instagram_caption": captions.get("instagram", ""),
+        "youtube_caption":   captions.get("youtube", ""),
+        "facebook_caption":  captions.get("facebook", ""),
+        "bluesky_caption":   captions.get("bluesky", ""),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
