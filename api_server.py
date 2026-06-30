@@ -1400,6 +1400,10 @@ _yt_token_cache: dict = {}  # in-memory; seeded from env var or file at startup
 FB_PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
 FB_PAGE_ID    = os.environ.get("FB_PAGE_ID", "")   # numeric page ID
 
+WHOP_API_KEY      = os.environ.get("WHOP_API_KEY", "")
+WHOP_COMPANY_ID   = os.environ.get("WHOP_COMPANY_ID", "")
+ETSY_SHARED_SECRET = os.environ.get("ETSY_SHARED_SECRET", "")
+
 
 def _yt_load_token() -> dict:
     if _yt_token_cache:
@@ -1924,6 +1928,462 @@ def engage_comments(req: EngageCommentsRequest):
                 results["errors"].append(f"Facebook reply failed for {cid}: {post_r.text[:200]}")
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Competitor intelligence — Etsy + Whop scraping + Claude analysis
+# ---------------------------------------------------------------------------
+
+_etsy_competitor_cache: dict = {}
+
+
+class EtsyCompetitorRequest(BaseModel):
+    keywords: list[str] = ["contractor tools excel", "hvac pricing calculator", "landlord spreadsheet", "rental property calculator", "bid estimator contractor"]
+    max_per_keyword: int = 10
+    include_reviews: bool = True
+
+
+@app.post("/scrape_etsy_competitors")
+def scrape_etsy_competitors(req: EtsyCompetitorRequest):
+    import datetime, requests as _req
+
+    today = datetime.date.today().isoformat()
+    if today in _etsy_competitor_cache:
+        return _etsy_competitor_cache[today]
+
+    headers = {"x-api-key": ETSY_CLIENT_ID}
+    all_listings = []
+    all_reviews: dict = {}
+
+    for kw in req.keywords:
+        try:
+            r = _req.get(
+                "https://openapi.etsy.com/v3/application/listings/active",
+                headers=headers,
+                params={
+                    "keywords": kw,
+                    "limit": req.max_per_keyword,
+                    "sort_on": "score",
+                    "sort_order": "desc",
+                    "includes": "Images,Shop",
+                },
+                timeout=20,
+            )
+            if not r.ok:
+                continue
+            results = r.json().get("results", [])
+            for item in results:
+                price_data = item.get("price", {})
+                divisor = price_data.get("divisor", 100) or 100
+                price_val = price_data.get("amount", 0) / divisor
+
+                shop = item.get("shop", {}) or {}
+                listing = {
+                    "listing_id": item.get("listing_id"),
+                    "title": item.get("title", ""),
+                    "description": (item.get("description") or "")[:300],
+                    "price": price_val,
+                    "num_favorers": item.get("num_favorers", 0),
+                    "tags": item.get("tags", []),
+                    "url": item.get("url", ""),
+                    "shop_name": shop.get("shop_name", ""),
+                    "keyword": kw,
+                }
+                all_listings.append(listing)
+
+                if req.include_reviews and item.get("listing_id"):
+                    lid = item["listing_id"]
+                    try:
+                        rv = _req.get(
+                            f"https://openapi.etsy.com/v3/application/listings/{lid}/reviews",
+                            headers=headers,
+                            params={"limit": 5},
+                            timeout=15,
+                        )
+                        if rv.ok:
+                            review_results = rv.json().get("results", [])
+                            all_reviews[str(lid)] = [
+                                {"rating": rev.get("rating"), "review": rev.get("review", "")}
+                                for rev in review_results
+                            ]
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    result = {"listings": all_listings, "reviews": all_reviews, "total": len(all_listings)}
+    _etsy_competitor_cache[today] = result
+    return result
+
+
+class WhopScrapeRequest(BaseModel):
+    keywords: list[str] = ["contractor tools", "landlord spreadsheet", "real estate calculator", "hvac tools", "property management"]
+    max_per_keyword: int = 5
+
+
+@app.post("/scrape_whop_competitors")
+def scrape_whop_competitors_start(req: WhopScrapeRequest):
+    """Start async Whop marketplace scrape. Poll GET /scrape/{job_id}."""
+    import uuid, threading
+    job_id = uuid.uuid4().hex
+    _scrape_jobs[job_id] = {"status": "pending"}
+
+    def _run():
+        import asyncio
+
+        async def _scrape_async():
+            try:
+                from playwright.async_api import async_playwright
+                all_products = []
+                all_reviews: dict = {}
+
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    ctx = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                    page = await ctx.new_page()
+
+                    for kw in req.keywords:
+                        try:
+                            await page.goto(f"https://whop.com/marketplace/?q={kw}", timeout=30000)
+                            await page.wait_for_timeout(3000)
+
+                            cards = await page.query_selector_all("[data-testid='product-card'], .product-card, article")
+                            seen = 0
+                            for card in cards:
+                                if seen >= req.max_per_keyword:
+                                    break
+                                try:
+                                    name_el = await card.query_selector("h2, h3, [class*='title'], [class*='name']")
+                                    name = await name_el.inner_text() if name_el else ""
+                                    price_el = await card.query_selector("[class*='price'], [class*='cost']")
+                                    price = await price_el.inner_text() if price_el else ""
+                                    desc_el = await card.query_selector("p, [class*='desc']")
+                                    desc = await desc_el.inner_text() if desc_el else ""
+                                    link_el = await card.query_selector("a")
+                                    href = await link_el.get_attribute("href") if link_el else ""
+                                    url = href if href and href.startswith("http") else f"https://whop.com{href}" if href else ""
+
+                                    if not name:
+                                        continue
+
+                                    product = {
+                                        "name": name.strip(),
+                                        "price": price.strip(),
+                                        "description": desc.strip()[:300],
+                                        "url": url,
+                                        "keyword": kw,
+                                        "seller": "",
+                                        "member_count": "",
+                                        "rating": "",
+                                    }
+
+                                    if url:
+                                        try:
+                                            detail = await ctx.new_page()
+                                            await detail.goto(url, timeout=20000)
+                                            await detail.wait_for_timeout(2000)
+                                            full_desc_el = await detail.query_selector("[class*='description'], [class*='about']")
+                                            if full_desc_el:
+                                                product["full_description"] = (await full_desc_el.inner_text())[:800]
+                                            review_els = await detail.query_selector_all("[class*='review'], [class*='testimonial']")
+                                            reviews = []
+                                            for rev_el in review_els[:5]:
+                                                rev_text = await rev_el.inner_text()
+                                                reviews.append(rev_text.strip()[:300])
+                                            if reviews:
+                                                all_reviews[url] = reviews
+                                            await detail.close()
+                                        except Exception:
+                                            pass
+
+                                    all_products.append(product)
+                                    seen += 1
+                                except Exception:
+                                    continue
+                        except Exception:
+                            continue
+
+                    await browser.close()
+
+                return {"products": all_products, "reviews": all_reviews, "total": len(all_products)}
+            except Exception as e:
+                raise RuntimeError(str(e))
+
+        return asyncio.run(_scrape_async())
+
+    def _thread():
+        try:
+            result = _run()
+            _scrape_jobs[job_id] = {"status": "done", "result": result}
+        except Exception as e:
+            _scrape_jobs[job_id] = {"status": "error", "error": str(e)}
+
+    import threading
+    threading.Thread(target=_thread, daemon=True).start()
+    return {"status": "pending", "job_id": job_id, "poll_url": f"https://{PUBLIC_BASE}/scrape/{job_id}"}
+
+
+class ReviewAnalysisRequest(BaseModel):
+    etsy_data: dict = {}
+    whop_data: dict = {}
+
+
+@app.post("/analyze_competitor_reviews")
+def analyze_competitor_reviews(req: ReviewAnalysisRequest):
+    import anthropic, json as _json, datetime as _dt
+
+    etsy_reviews = req.etsy_data.get("reviews", {})
+    whop_reviews = req.whop_data.get("reviews", {})
+    etsy_listings = req.etsy_data.get("listings", [])
+    whop_products = req.whop_data.get("products", [])
+
+    review_text_parts = []
+    for lid, revs in etsy_reviews.items():
+        for rv in revs:
+            t = rv.get("review", "")
+            if t:
+                review_text_parts.append(f"[Etsy listing {lid}] {t}")
+    for url, revs in whop_reviews.items():
+        for rv in revs:
+            if isinstance(rv, str) and rv:
+                review_text_parts.append(f"[Whop {url}] {rv}")
+
+    listing_context = [{"title": l.get("title", ""), "desc": l.get("description", ""), "price": l.get("price", 0)} for l in etsy_listings[:20]]
+    product_context = [{"name": p.get("name", ""), "desc": p.get("description", ""), "price": p.get("price", "")} for p in whop_products[:20]]
+
+    user_msg = (
+        f"Here are {len(listing_context)} Etsy listings and {len(product_context)} Whop products in the contractor/landlord/real-estate niche.\n\n"
+        f"ETSY LISTINGS:\n{_json.dumps(listing_context, indent=2)}\n\n"
+        f"WHOP PRODUCTS:\n{_json.dumps(product_context, indent=2)}\n\n"
+        f"CUSTOMER REVIEWS ({len(review_text_parts)} total):\n" + "\n".join(review_text_parts[:80]) + "\n\n"
+        "Analyze all review text looking for:\n"
+        "- Pain points the existing product doesn't solve\n"
+        "- Feature requests mentioned in reviews\n"
+        "- Underserved niches (I wish this worked for X type of contractor)\n"
+        "- Bundle opportunities (I bought 3 different tools for this)\n"
+        "- Price sensitivity signals\n\n"
+        'Return JSON: {"product_ideas": [{"title": "...", "gap": "...", "evidence": "direct quote", "platform_source": "etsy|whop", "estimated_price": 49, "priority": "high|medium|low"}]}'
+    )
+
+    system_msg = (
+        "You are a product strategist analyzing competitor reviews in the digital tools market "
+        "(contractor spreadsheets, landlord calculators, real-estate tools). "
+        "Extract concrete, actionable product ideas backed by evidence from the reviews. "
+        "Return only valid JSON."
+    )
+
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=2048,
+        system=system_msg,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    raw = msg.content[0].text.strip()
+    try:
+        data = _json.loads(raw)
+    except Exception:
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+        data = _json.loads(raw)
+
+    ideas = data.get("product_ideas", [])
+
+    ideas_file = BASE / "products" / "ideas.md"
+    ideas_file.parent.mkdir(parents=True, exist_ok=True)
+    if not ideas_file.exists():
+        ideas_file.write_text("# Product Ideas from Comments\n\n")
+    today = _dt.date.today().isoformat()
+    for idea in ideas:
+        if idea.get("priority") in ("high", "medium"):
+            with ideas_file.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    f"## {today} — competitor analysis ({idea.get('platform_source', 'unknown')})\n"
+                    f"**Idea:** {idea.get('title', '')}\n"
+                    f"**Gap:** {idea.get('gap', '')}\n"
+                    f"**Evidence:** {idea.get('evidence', '')}\n"
+                    f"**Est. Price:** ${idea.get('estimated_price', '')}\n"
+                    f"**Priority:** {idea.get('priority', '')}\n\n"
+                )
+
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Whop + Etsy publishing
+# ---------------------------------------------------------------------------
+
+class WhopPublishRequest(BaseModel):
+    name: str
+    description: str
+    price: float
+    file_url: str
+    product_name: str = ""
+
+
+def _whop_publish(name: str, description: str, price: float, file_url: str) -> dict:
+    import requests as _req
+    if not WHOP_API_KEY:
+        return {"status": "needs_setup", "message": "Set WHOP_API_KEY and WHOP_COMPANY_ID in Railway env vars"}
+
+    headers = {"Authorization": f"Bearer {WHOP_API_KEY}", "Content-Type": "application/json"}
+
+    r1 = _req.post(
+        "https://api.whop.com/api/v5/products",
+        headers=headers,
+        json={"name": name, "visibility": "visible", "company_id": WHOP_COMPANY_ID},
+        timeout=20,
+    )
+    if not r1.ok:
+        return {"status": "error", "detail": r1.text}
+    product_data = r1.json()
+    product_id = product_data.get("id") or product_data.get("data", {}).get("id")
+    direct_link = product_data.get("direct_link") or product_data.get("data", {}).get("direct_link", "")
+
+    r2 = _req.post(
+        "https://api.whop.com/api/v5/experiences",
+        headers=headers,
+        json={
+            "product_id": product_id,
+            "name": "Download",
+            "access_type": "download_url",
+            "download_url": file_url,
+        },
+        timeout=20,
+    )
+    if not r2.ok:
+        return {"status": "error", "detail": r2.text, "product_id": product_id}
+
+    return {"status": "ok", "product_id": product_id, "whop_url": direct_link}
+
+
+@app.post("/publish_whop")
+def publish_whop(req: WhopPublishRequest):
+    return _whop_publish(req.name, req.description, req.price, req.file_url)
+
+
+class PublishAllRequest(BaseModel):
+    name: str
+    description: str
+    price: float
+    file_url: str
+    tags: list[str] = []
+    etsy_taxonomy_id: int = 2078
+
+
+@app.post("/publish_all")
+def publish_all(req: PublishAllRequest):
+    import requests as _req, json as _json
+
+    whop_result = _whop_publish(req.name, req.description, req.price, req.file_url)
+
+    token_file = BASE / "etsy_token.json"
+    etsy_result: dict = {}
+    if token_file.exists():
+        token_data = _json.loads(token_file.read_text())
+        access_token = token_data.get("access_token", "")
+        shop_id = token_data.get("shop_id", "")
+        if access_token and shop_id:
+            etsy_headers = {
+                "x-api-key": ETSY_CLIENT_ID,
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "quantity": 999,
+                "title": req.name,
+                "description": req.description,
+                "price": req.price,
+                "who_made": "i_did",
+                "when_made": "made_to_order",
+                "taxonomy_id": req.etsy_taxonomy_id,
+                "type": "download",
+                "tags": req.tags[:13],
+                "shipping_profile_id": None,
+            }
+            er = _req.post(
+                f"https://openapi.etsy.com/v3/application/shops/{shop_id}/listings",
+                headers=etsy_headers,
+                json=body,
+                timeout=20,
+            )
+            if er.ok:
+                ed = er.json()
+                etsy_result = {
+                    "etsy_listing_id": ed.get("listing_id"),
+                    "etsy_url": ed.get("url", ""),
+                }
+            else:
+                etsy_result = {"etsy_error": er.text}
+        else:
+            etsy_result = {"etsy_error": "No valid token or shop_id in etsy_token.json"}
+    else:
+        etsy_result = {"etsy_error": "etsy_token.json not found — visit /etsy_auth first"}
+
+    return {
+        "etsy_url": etsy_result.get("etsy_url", ""),
+        "whop_url": whop_result.get("whop_url", ""),
+        "etsy_listing_id": etsy_result.get("etsy_listing_id"),
+        "whop_product_id": whop_result.get("product_id"),
+        "etsy_detail": etsy_result,
+        "whop_detail": whop_result,
+    }
+
+
+@app.post("/publish_existing_products")
+def publish_existing_products():
+    """Batch-publish all xlsx products to Whop using title/description from listings/*.txt files."""
+    import re
+
+    listings_dir = BASE / "listings"
+    products_dir = BASE / "products"
+    summary = {"published": [], "skipped": [], "errors": []}
+
+    xlsx_files = list(products_dir.glob("*.xlsx"))
+    if not xlsx_files:
+        return {"status": "no_products_found", "summary": summary}
+
+    if not WHOP_API_KEY:
+        return {"status": "needs_setup", "message": "Set WHOP_API_KEY and WHOP_COMPANY_ID in Railway env vars"}
+
+    for xlsx in xlsx_files:
+        stem = xlsx.stem
+        txt_file = listings_dir / f"{stem}.txt"
+
+        title = stem.replace("_", " ").strip()
+        description = ""
+        price = 19.0
+
+        if txt_file.exists():
+            raw = txt_file.read_text(encoding="utf-8", errors="ignore")
+            lines = raw.strip().splitlines()
+            for line in lines:
+                if line.strip():
+                    title = line.strip()[:140]
+                    break
+            desc_lines = []
+            for line in lines[1:30]:
+                if line.strip():
+                    desc_lines.append(line.strip())
+            description = " ".join(desc_lines)[:2000]
+            price_match = re.search(r"\$\s*(\d+(?:\.\d+)?)", raw)
+            if price_match:
+                price = float(price_match.group(1))
+
+        file_url = f"https://{PUBLIC_BASE}/media/{xlsx.name}"
+
+        result = _whop_publish(title, description, price, file_url)
+        if result.get("status") == "ok":
+            summary["published"].append({"file": xlsx.name, "product_id": result.get("product_id"), "whop_url": result.get("whop_url")})
+        elif result.get("status") == "needs_setup":
+            return result
+        else:
+            summary["errors"].append({"file": xlsx.name, "detail": result.get("detail", "unknown error")})
+
+    summary["total_published"] = len(summary["published"])
+    summary["total_errors"] = len(summary["errors"])
+    return {"status": "done", "summary": summary}
 
 
 if __name__ == "__main__":
