@@ -8,6 +8,7 @@ __pycache__/
 *.mp3
 *.webm
 *.xlsx
+!products/listing_kits/**/*.xlsx
 *.pdf
 products/audio/
 products/browser_demos/
